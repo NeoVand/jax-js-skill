@@ -1,5 +1,11 @@
 # jax-js skill
 
+<!-- The skills.sh badge only renders once the repo has been indexed, which
+     happens after the first `npx skills add NeoVand/jax-js-skill`. Until then it
+     serves a literal "resource not found" image. Uncomment when it resolves:
+[![skills.sh](https://skills.sh/b/NeoVand/jax-js-skill)](https://skills.sh/NeoVand/jax-js-skill)
+-->
+
 An [agent skill](https://skills.sh) for building and training **real neural
 networks in the browser** with [jax-js](https://github.com/ekzhang/jax-js) —
 JAX's semantics (autodiff, `jit`, `vmap`, pytrees, optax) in TypeScript, running
