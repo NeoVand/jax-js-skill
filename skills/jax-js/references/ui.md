@@ -202,6 +202,31 @@ animation; render a meaningful static frame instead.
   tabular numerals so digits do not jitter.
 - Disable, do not hide. A control that vanishes mid-run is disorienting.
 
+## Never render model output as HTML
+
+A sampler emits whatever the weights make likely, and once a user can type the
+prompt, they choose part of that. Put it on the page as **text**, never as
+markup:
+
+```ts
+// ✓ escaped
+el.textContent = sample.text;
+// ✗ an XSS sink fed by a text generator
+el.innerHTML = sample.text;
+```
+
+Same rule in every framework: `{text}` in Svelte and React is escaped and is
+what you want; `{@html text}` and `dangerouslySetInnerHTML` are not. If the demo
+genuinely needs to render generated markdown, sanitise it — do not hand raw
+model output to a markdown renderer with HTML passthrough enabled.
+
+Static analyzers flag this data flow (user text → model → page) as an indirect
+prompt-injection risk. For an in-browser model that only writes into a `<div>`
+the label overstates it: there is no tool use, no agent loop, and no privileged
+action to hijack. But the escaping rule costs nothing and the flag disappears,
+so just follow it. It matters for real if you ever feed generated text into
+something that *acts* on it.
+
 ## Say what the numbers mean
 
 A loss of 0.35 means nothing on its own. Show the baseline: `uniform guess would
