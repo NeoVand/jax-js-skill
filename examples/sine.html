@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>1 · The approximator</title>
+		<link rel="stylesheet" href="/src/style.css" />
+	</head>
+	<body>
+		<h1>1 · The approximator</h1>
+		<p class="blurb">
+			A small MLP learns a sine wave. Dashed grey is the target; the solid line is what the network
+			currently believes. <a href="/">← both examples</a>
+		</p>
+		<div class="plate">
+			<header>
+				<span class="title">Plate 1 · fitting a curve</span>
+				<button id="go" data-kind="primary">Train</button>
+				<span class="status num" id="status">idle</span>
+			</header>
+			<div class="stage">
+				<canvas id="stage"></canvas>
+			</div>
+		</div>
+		<pre id="out">ready.</pre>
+		<script type="module" src="/src/sine.ts"></script>
+	</body>
+</html>

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>2 · The scribe</title>
+		<link rel="stylesheet" href="/src/style.css" />
+	</head>
+	<body>
+		<h1>2 · The scribe</h1>
+		<p class="blurb">
+			A character-level transformer learns a small invented language. Training runs in one worker;
+			a second worker writes each specimen from a couriered checkpoint, so the loss curve never
+			stops for the samples. <a href="/">← both examples</a>
+		</p>
+		<div class="plate">
+			<header>
+				<span class="title">Plate 1 · training</span>
+				<button id="go" data-kind="primary" disabled>Train</button>
+				<button id="reset" disabled>Reset</button>
+				<span class="status num" id="status">booting…</span>
+			</header>
+			<div class="stage"><canvas id="chart"></canvas></div>
+		</div>
+		<div class="plate">
+			<header>
+				<span class="title">Plate 2 · what it writes</span>
+				<span class="status num" id="sampler-note"></span>
+			</header>
+			<div class="stage">
+				<div class="samples" id="samples"></div>
+			</div>
+		</div>
+		<pre id="out"></pre>
+		<script type="module" src="/src/gpt.ts"></script>
+	</body>
+</html>

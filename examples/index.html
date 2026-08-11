@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>jax-js skill — examples</title>
+		<link rel="stylesheet" href="/src/style.css" />
+	</head>
+	<body>
+		<h1>jax-js skill — runnable examples</h1>
+		<p class="blurb">
+			Two working models, both training in this tab on your own GPU. They exist to prove the
+			skill's templates run, and to be read.
+		</p>
+		<ul class="index">
+			<li>
+				<a href="/sine.html"><strong>1 · The approximator</strong></a><br />
+				A small MLP fits a sine wave on the main thread. Pytree params, <code>valueAndGrad</code>,
+				optax Adam, a jitted step, a canvas. Runs anywhere — WebGPU, wasm, or CPU.
+			</li>
+			<li>
+				<a href="/gpt.html"><strong>2 · The scribe</strong></a><br />
+				A 2-layer character transformer, trained in a Web Worker, with a second worker writing
+				samples from couriered checkpoints so the loss curve never pauses. Needs WebGPU.
+			</li>
+		</ul>
+	</body>
+</html>
