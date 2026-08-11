@@ -274,6 +274,7 @@ Copy, don't retype. Each file is runnable and tested.
 | `templates/worker.ts` | Worker that owns the model; RPC dispatch, transferables, `stop` handling |
 | `templates/engine.ts` | Main-thread promise-RPC client with streaming metrics |
 | `templates/twin-engine.ts` | Trainer + sampler pair; checkpoint courier so training never pauses |
+| `templates/tokens.ts` | The token boundary: encode text in the app, hand the worker validated integer IDs |
 | `templates/model-mlp.ts` | Configurable MLP: activations, mse/xent, VAE bottleneck |
 | `templates/model-transformer.ts` | Decoder-only transformer: init, forward, loss, sampling, attention capture |
 | `templates/fused-adam.ts` | Optimizer fused inside `jit` |

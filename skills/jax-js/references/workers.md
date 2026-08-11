@@ -76,6 +76,24 @@ private onMessage(e: MessageEvent) {
 }
 ```
 
+### The worker validates everything it receives
+
+The main thread is not a trust boundary. Every RPC field gets checked on
+receipt: token sequences through `toPromptTokens()` (integers inside the
+vocabulary, length-capped), numeric knobs clamped to sane ranges.
+
+```ts
+const prompt = toPromptTokens(req.promptTokens ?? [], {
+  vocab: c.vocab, maxLen: Math.floor(c.blockSize / 2) });
+const temperature = num(req.temperature, 0.8, 1e-4, 100);
+const topK = Math.floor(num(req.topK, 40, 0, c.vocab));
+```
+
+The message contract is **integer token IDs, never text** — encoding happens in
+the application layer (`templates/tokens.ts`). That keeps arbitrary strings out
+of model execution entirely, and turns an encoder/vocabulary mismatch into a
+thrown error instead of silently corrupt one-hots.
+
 ### Transferables
 
 A transferred `ArrayBuffer` is **detached** on the sending side. If the caller

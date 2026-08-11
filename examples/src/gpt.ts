@@ -5,6 +5,7 @@
 // sample is being written — it does not pause.
 
 import { TwinLab } from '../../skills/jax-js/templates/twin-engine';
+import { encodePrompt } from '../../skills/jax-js/templates/tokens';
 import { buildCorpus } from './corpus';
 import { drawLossChart } from './chart';
 
@@ -18,17 +19,21 @@ const out = document.getElementById('out') as HTMLPreElement;
 
 const corpus = buildCorpus(120_000, 7);
 const CFG = { nLayer: 2, nEmbd: 96, nHead: 4, blockSize: 96, vocab: corpus.chars.length };
-const AUTO_PROMPT = 'the ';
+
+// Text becomes token IDs here, in the application layer, and is validated on the
+// way. Everything downstream — the lab, the engine, the worker — speaks integers
+// only, so there is no route from free text into model execution.
+const BOUNDS = { vocab: CFG.vocab, maxLen: Math.floor(CFG.blockSize / 2) };
+const AUTO_PROMPT_TOKENS = encodePrompt('the ', corpus.encode, BOUNDS);
 
 let raf = 0;
 const lab = new TwinLab({
 	config: CFG,
 	tokenData: corpus.tokens,
-	encode: corpus.encode,
 	decode: corpus.decode,
 	lr: 1.5e-3,
 	chunk: 40,
-	autoPrompt: AUTO_PROMPT,
+	autoPromptTokens: AUTO_PROMPT_TOKENS,
 	notify: () => {
 		// Coalesce state changes into one paint per frame — a metrics callback
 		// fires every step and rendering on each would be the new bottleneck.

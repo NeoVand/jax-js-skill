@@ -18,12 +18,14 @@
 // wire it to $state assignments (Svelte), setState (React), or a store.
 
 import { Engine, detectWebGPU, type ModelConfig, type TrainMetrics } from './engine';
+import { toPromptTokens } from './tokens';
 
 export type Phase = 'idle' | 'loading' | 'ready' | 'training' | 'error' | 'no-webgpu';
 
 export interface Sample {
 	id: number;
 	step: number;
+	/** The prompt as the model actually read it — decoded back from its IDs. */
 	prompt: string;
 	text: string;
 }
@@ -31,12 +33,17 @@ export interface Sample {
 export interface LabOptions {
 	config: ModelConfig;
 	tokenData: Uint16Array;
+	/** ids → text, for display. Output only; the lab never encodes. */
 	decode: (ids: number[]) => string;
-	encode: (text: string) => number[];
 	lr?: number;
 	/** Steps per burst; a held-out eval and a fresh sample follow each one. */
 	chunk?: number;
-	autoPrompt?: string;
+	/**
+	 * The fixed prompt re-asked after every burst, as token IDs. Encode it once
+	 * in the application layer with `encodePrompt()` from tokens.ts — this lab
+	 * accepts IDs only, so no path exists from free text into model execution.
+	 */
+	autoPromptTokens?: readonly number[];
 	/** Called after any observable field changes. */
 	notify?: () => void;
 }
@@ -310,33 +317,47 @@ export class TwinLab {
 	/** The fixed question, asked every burst: same prompt, same temperature, so
 	 *  the only thing that changes between samples is the weights. */
 	private autoSample(): Promise<void> {
-		const p = this.writeSample(this.opts.autoPrompt ?? '', 0.8);
+		const p = this.writeSample(this.opts.autoPromptTokens ?? [], 0.8);
 		this.samplePromise = p;
 		return p;
 	}
 
-	sampleNow(prompt: string, temperature = 0.8): Promise<void> {
-		const p = this.writeSample(prompt, temperature);
+	/**
+	 * Sample from a caller-supplied prompt, given as token IDs. Encode text with
+	 * `encodePrompt()` from tokens.ts before calling — it validates that every ID
+	 * is an integer inside the model's vocabulary, and throws if the caller's
+	 * encoder and the model disagree.
+	 */
+	sampleNow(promptTokens: readonly number[], temperature = 0.8): Promise<void> {
+		const p = this.writeSample(promptTokens, temperature);
 		this.samplePromise = p;
 		return p;
 	}
 
-	private async writeSample(promptText: string, temperature: number): Promise<void> {
+	private async writeSample(
+		promptTokens: readonly number[],
+		temperature: number
+	): Promise<void> {
 		const myGen = this.gen;
 		const atStep = this.step;
 		try {
-			const ids = this.opts.encode(promptText);
+			// Validated at the boundary, and again inside the worker.
+			const ids = toPromptTokens(promptTokens as number[], {
+				vocab: this.opts.config.vocab,
+				maxLen: Math.floor(this.opts.config.blockSize / 2)
+			});
 			const via = await this.sampleEngine();
 			if (!via || myGen !== this.gen) return;
 			const r = await via.sample(ids, { temperature, topK: 40, maxTokens: 120 });
 			if (myGen !== this.gen) return;
 			this.samples = [
-				{ id: ++this.sampleSeq, step: atStep, prompt: promptText, text: r.text },
+				// what the model actually read, decoded back from its own IDs
+				{ id: ++this.sampleSeq, step: atStep, prompt: this.opts.decode(ids), text: r.text },
 				...this.samples
 			].slice(0, 5);
 			this.touch();
 		} catch {
-			// disposed mid-sample
+			// disposed mid-sample, or a prompt whose IDs are not in this vocabulary
 		}
 	}
 

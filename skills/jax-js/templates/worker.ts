@@ -18,6 +18,7 @@ import {
 import { adam, applyUpdates } from '@jax-js/optax';
 import * as model from './model-transformer';
 import type { ModelConfig } from './model-transformer';
+import { toPromptTokens } from './tokens';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -163,13 +164,25 @@ function handleValLoss() {
 	return { valLoss: total / N };
 }
 
+/** Bound a numeric RPC field to a sane range; the worker trusts no input. */
+function num(v: unknown, fallback: number, lo: number, hi: number): number {
+	const n = typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+	return Math.min(hi, Math.max(lo, n));
+}
+
 function handleSample(req: RpcRequest) {
 	const c = cfg!;
-	const prompt = (req.promptTokens as number[]) ?? [];
-	const temperature = (req.temperature as number) ?? 0.8;
-	const topK = (req.topK as number) ?? 40;
-	const maxTokens = Math.min((req.maxTokens as number) ?? 120, c.blockSize - 1);
-	const stopAt = req.stopToken as number | undefined;
+	// The message contract is integer token IDs only — never text. Re-validated
+	// here because the main thread is not a trust boundary (see tokens.ts).
+	const prompt = toPromptTokens(req.promptTokens ?? [], {
+		vocab: c.vocab,
+		maxLen: Math.floor(c.blockSize / 2)
+	});
+	const temperature = num(req.temperature, 0.8, 1e-4, 100);
+	const topK = Math.floor(num(req.topK, 40, 0, c.vocab));
+	const maxTokens = Math.floor(num(req.maxTokens, 120, 1, c.blockSize - 1));
+	const stopAt =
+		typeof req.stopToken === 'number' && Number.isInteger(req.stopToken) ? req.stopToken : undefined;
 
 	const forward = (tok: any, pos: any) => jitForward(tree.ref(params), tok, pos);
 	let tokens = prompt.slice(-Math.floor(c.blockSize / 2));

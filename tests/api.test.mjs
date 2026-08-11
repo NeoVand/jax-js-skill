@@ -22,6 +22,11 @@ import { adam, applyUpdates, chain, clipByGlobalNorm } from '@jax-js/optax';
 import * as mlp from '../skills/jax-js/templates/model-mlp.ts';
 import * as gpt from '../skills/jax-js/templates/model-transformer.ts';
 import { fusedAdam } from '../skills/jax-js/templates/fused-adam.ts';
+import {
+	toPromptTokens,
+	encodePrompt,
+	InvalidTokensError
+} from '../skills/jax-js/templates/tokens.ts';
 
 before(async () => {
 	const devices = await init();
@@ -36,6 +41,76 @@ const throws = (fn) => {
 		return true;
 	}
 };
+
+// ── the token boundary: only integer IDs reach the model ────────────────────
+describe('token boundary', () => {
+	const bounds = { vocab: 24, maxLen: 8 };
+
+	test('accepts valid ids and returns a defensive copy', () => {
+		const src = [0, 5, 23];
+		const out = toPromptTokens(src, bounds);
+		assert.deepEqual(out, [0, 5, 23]);
+		out[0] = 99;
+		assert.equal(src[0], 0, 'must not alias the caller array');
+	});
+
+	test('truncates to the most recent maxLen ids', () => {
+		assert.deepEqual(toPromptTokens([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], bounds), [
+			3, 4, 5, 6, 7, 8, 9, 10
+		]);
+	});
+
+	for (const [name, bad] of [
+		['out of range high', [0, 24]],
+		['out of range low', [-1]],
+		['non-integer', [1.5]],
+		['NaN', [NaN]],
+		['Infinity', [Infinity]],
+		['string that looks numeric', ['3']],
+		['null element', [null]],
+		['undefined element', [undefined]],
+		['object element', [{}]],
+		['nested array', [[1]]]
+	]) {
+		test(`rejects ${name}`, () => {
+			assert.throws(() => toPromptTokens(bad, bounds), InvalidTokensError);
+		});
+	}
+
+	for (const [name, bad] of [
+		['a string', 'hello'],
+		['null', null],
+		['undefined', undefined],
+		['an object', { 0: 1, length: 1 }],
+		['a number', 7]
+	]) {
+		test(`rejects ${name} as the sequence itself`, () => {
+			assert.throws(() => toPromptTokens(bad, bounds), InvalidTokensError);
+		});
+	}
+
+	test('encodePrompt validates whatever the encoder returns', () => {
+		const rogue = () => [0, 999]; // encoder disagrees with the vocabulary
+		assert.throws(() => encodePrompt('hi', rogue, bounds), InvalidTokensError);
+	});
+
+	test('encodePrompt rejects a non-string', () => {
+		assert.throws(() => encodePrompt(42, (s) => [0], bounds), InvalidTokensError);
+	});
+
+	test('encodePrompt passes clean text through', () => {
+		const enc = (s) => [...s].map((c) => c.charCodeAt(0) % 24);
+		assert.deepEqual(encodePrompt('abc', enc, bounds), [
+			'a'.charCodeAt(0) % 24,
+			'b'.charCodeAt(0) % 24,
+			'c'.charCodeAt(0) % 24
+		]);
+	});
+
+	test('rejects a bad vocab bound', () => {
+		assert.throws(() => toPromptTokens([0], { vocab: 0, maxLen: 4 }), InvalidTokensError);
+	});
+});
 
 // ── SKILL.md law 1: arrays are moved ────────────────────────────────────────
 describe('law 1 — ownership', () => {

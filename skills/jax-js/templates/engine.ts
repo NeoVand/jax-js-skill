@@ -6,6 +6,8 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+import { toPromptTokens } from './tokens';
+
 export interface ModelConfig {
 	nLayer: number;
 	nEmbd: number;
@@ -31,6 +33,7 @@ export interface EngineOptions {
 	tokenData: Uint16Array;
 	seed?: number;
 	lr?: number;
+	/** ids → text, for display only. Output, never input. */
 	decode?: (ids: number[]) => string;
 	stopToken?: number;
 }
@@ -40,6 +43,9 @@ export class Engine {
 	private pending = new Map<number, Pending>();
 	private nextId = 1;
 	private opts: EngineOptions;
+	/** Set at init(); bounds every token sequence the engine forwards. */
+	private vocab = 0;
+	private blockSize = 0;
 	device = 'unknown';
 	paramCount = 0;
 
@@ -99,6 +105,8 @@ export class Engine {
 		const r = await this.call<{ device: string; paramCount: number }>('init', payload, transfer);
 		this.device = r.device;
 		this.paramCount = r.paramCount;
+		this.vocab = config.vocab;
+		this.blockSize = config.blockSize;
 	}
 
 	/** Run `steps` updates; metrics stream through onMetrics as they happen. */
@@ -116,12 +124,20 @@ export class Engine {
 		return r.valLoss;
 	}
 
+	/**
+	 * Sample a continuation. `promptTokens` must be integer token IDs, not text:
+	 * encode in the application layer with `encodePrompt()` from tokens.ts. The
+	 * IDs are validated here and again inside the worker.
+	 */
 	async sample(
-		promptTokens: number[],
+		promptTokens: readonly number[],
 		opts?: { temperature?: number; topK?: number; maxTokens?: number }
 	): Promise<{ tokens: number[]; text: string }> {
 		const r = await this.call<{ tokens: number[] }>('sample', {
-			promptTokens: [...promptTokens],
+			promptTokens: toPromptTokens(promptTokens as number[], {
+				vocab: this.vocab,
+				maxLen: this.blockSize
+			}),
 			temperature: opts?.temperature,
 			topK: opts?.topK,
 			maxTokens: opts?.maxTokens,

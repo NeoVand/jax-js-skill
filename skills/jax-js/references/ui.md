@@ -202,6 +202,33 @@ animation; render a meaningful static frame instead.
   tabular numerals so digits do not jitter.
 - Disable, do not hide. A control that vanishes mid-run is disorienting.
 
+## Only token IDs cross into the worker
+
+Encode text in the application layer and hand the worker **integers**, never a
+string. `templates/tokens.ts` is that boundary:
+
+```ts
+import { encodePrompt, toPromptTokens } from './tokens';
+
+const BOUNDS = { vocab: cfg.vocab, maxLen: Math.floor(cfg.blockSize / 2) };
+const ids = encodePrompt(userText, corpus.encode, BOUNDS);   // validated here
+await lab.sampleNow(ids);                                     // engine re-validates
+                                                              // worker validates again
+```
+
+Two reasons, one practical and one structural:
+
+- An out-of-range ID reaches `nn.oneHot(id, vocab)` and quietly corrupts a batch
+  — you get gibberish samples instead of an error. Validating says *your encoder
+  and your model disagree about the vocabulary*, which is the actual bug.
+- The main thread is not a trust boundary. The worker re-checks on receipt, so a
+  malformed message cannot reach model execution. It also means no code path
+  carries arbitrary text into the model, which is what static analyzers flag as
+  indirect prompt-injection exposure.
+
+`toPromptTokens` throws rather than clamping, and truncates over-long input to
+the most recent `maxLen` IDs — which is what a context window does anyway.
+
 ## Never render model output as HTML
 
 A sampler emits whatever the weights make likely, and once a user can type the
