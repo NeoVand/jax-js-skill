@@ -1,9 +1,13 @@
 # jax-js skill
 
-<!-- The skills.sh badge only renders once the repo has been indexed, which
-     happens after the first `npx skills add NeoVand/jax-js-skill`. Until then it
-     serves a literal "resource not found" image. Uncomment when it resolves:
-[![skills.sh](https://skills.sh/b/NeoVand/jax-js-skill)](https://skills.sh/NeoVand/jax-js-skill)
+[![skills.sh](https://img.shields.io/badge/skills.sh-jax--js-1f6feb)](https://skills.sh/neovand/jax-js-skill)
+[![license](https://img.shields.io/badge/license-MIT-555)](LICENSE)
+
+<!-- skills.sh also serves a live install-count badge, but it renders a literal
+     "resource not found" image while the count is still 0 — the directory page
+     exists and lists the skill, the counter just has not accumulated yet.
+     Swap the static badge above for this one once it shows a number:
+[![skills.sh](https://skills.sh/b/neovand/jax-js-skill)](https://skills.sh/neovand/jax-js-skill)
 -->
 
 An [agent skill](https://skills.sh) for building and training **real neural
