@@ -19,9 +19,11 @@ signatures stable.
 
 ## Initialisation — the failure that looks like a learning-rate bug
 
-**Never zero-initialise an output projection.** Zero-init on `wo`, `mlpFc2` or
-the classifier head blocks all gradient into the block interior at step 0: the
-loss sits flat, you lower the learning rate, and nothing changes.
+A zero output projection initially blocks gradients into the preceding branch,
+but the projection itself can learn on the first update. Zero initialization
+is therefore not a universal cause of permanent flat loss; some residual
+architectures use it deliberately. For these small demos, use small random
+output weights and inspect gradient norms when learning stalls.
 
 Use small-random instead — enough signal to start, small enough not to blow up
 the residual stream:
@@ -70,8 +72,8 @@ no hidden state and stays reproducible.
 ## Transformer — `templates/model-transformer.ts`
 
 A decoder-only stack: pre-norm RMSNorm, causal attention, 4× MLP, no biases, no
-dropout. Weight-tying is *not* used — a separate `lmHead` trains faster at these
-sizes.
+dropout. Weight-tying is not used in this template; a separate `lmHead` is an
+implementation choice, not a general speed or quality guarantee.
 
 Sizes that train at interactive speed on a laptop GPU:
 
@@ -80,7 +82,7 @@ Sizes that train at interactive speed on a laptop GPU:
 | toy / unit test | 2 | 32 | 4 | 16 | 8 | ~26k |
 | character LM, live demo | 2 | 96 | 4 | 96 | 24–100 | ~235k |
 | word-piece LM | 4 | 128 | 4 | 128 | 1–4k | ~1.3M |
-| the practical ceiling | 6 | 256 | 8 | 256 | 4k | ~7M |
+| larger example to benchmark | 6 | 256 | 8 | 256 | 4k | ~7M |
 
 Rules of thumb: `nEmbd % nHead === 0`; keep `vocab × blockSize × batch` modest,
 because the one-hot batch is `B·S·V` floats; and start from
@@ -141,7 +143,8 @@ about.
 differentiable, but there is no `nn.Conv2d` layer object — you carry the weights
 yourself, as with everything else. For MNIST-scale demos an MLP on flattened
 pixels is usually the better trade: fewer moving parts, and it trains in seconds.
-Reach for convolutions when the demo is *about* convolution.
+Consider convolutions when spatial structure and translation sharing help the
+task; compare held-out quality and browser cost against the simpler MLP.
 
 ## Loss functions
 

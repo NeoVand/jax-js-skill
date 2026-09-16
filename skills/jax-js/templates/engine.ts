@@ -1,8 +1,8 @@
 // Main-thread client for the training worker: a promise RPC with a streaming
 // side-channel for per-step metrics. One Engine per mounted model.
 //
-// This class is a plain object, NOT framework state. Hold it in a module-level
-// field or a `let engine: Engine | null = null` — never in $state / useState.
+// Keep the resource handle in a component-owned field or ref, and expose
+// metrics as reactive state. Dispose even if initialization is still pending.
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -42,6 +42,8 @@ export class Engine {
 	private worker: Worker;
 	private pending = new Map<number, Pending>();
 	private nextId = 1;
+	private closed = false;
+	private disposal: Promise<void> | null = null;
 	private opts: EngineOptions;
 	/** Set at init(); bounds every token sequence the engine forwards. */
 	private vocab = 0;
@@ -56,10 +58,23 @@ export class Engine {
 		this.worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
 		this.worker.onmessage = (e) => this.onMessage(e);
 		this.worker.onerror = (e) => {
-			const err = new Error(e.message || 'worker error');
-			for (const p of this.pending.values()) p.reject(err);
-			this.pending.clear();
+			this.shutdown(new Error(e.message || 'worker error'));
 		};
+		this.worker.onmessageerror = () => this.shutdown(new Error('worker message could not be decoded'));
+	}
+
+	private rejectPending(error: Error, exceptId?: number) {
+		for (const [id, request] of this.pending) {
+			if (id === exceptId) continue;
+			this.pending.delete(id);
+			request.reject(error);
+		}
+	}
+
+	private shutdown(error: Error) {
+		this.closed = true;
+		this.rejectPending(error);
+		this.worker.terminate();
 	}
 
 	private onMessage(e: MessageEvent) {
@@ -81,10 +96,16 @@ export class Engine {
 		transfer: Transferable[] = [],
 		onMetrics?: (m: TrainMetrics) => void
 	): Promise<T> {
+		if (this.closed) return Promise.reject(new Error('Engine disposed or closed'));
 		const id = this.nextId++;
 		return new Promise<T>((resolve, reject) => {
 			this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, onMetrics });
-			this.worker.postMessage({ id, op, ...payload }, transfer);
+			try {
+				this.worker.postMessage({ id, op, ...payload }, transfer);
+			} catch (error) {
+				this.pending.delete(id);
+				reject(error);
+			}
 		});
 	}
 
@@ -168,16 +189,29 @@ export class Engine {
 		return r.tokens;
 	}
 
-	/** A worker mid-jit answers no RPC promptly, and a worker that never releases
-	 *  its GPU device blocks the next one from getting it — so the graceful
-	 *  request gets a deadline, and termination happens either way. */
-	async dispose(): Promise<void> {
-		try {
-			await Promise.race([this.call('dispose'), new Promise((r) => setTimeout(r, 400))]);
-		} finally {
-			this.worker.terminate();
-			this.pending.clear();
-		}
+	/** Compilation can delay a graceful reply. Bound cleanup, reject callers,
+	 *  and terminate even when the worker cannot process its disposal request. */
+	dispose(): Promise<void> {
+		if (this.disposal) return this.disposal;
+		if (this.closed) return Promise.resolve();
+		const disposeId = this.nextId;
+		const reply = this.call('dispose');
+		this.closed = true;
+		this.rejectPending(new Error('Engine disposed'), disposeId);
+		this.disposal = (async () => {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			try {
+				await Promise.race([reply, new Promise<void>((resolve) => {
+					timer = setTimeout(resolve, 400);
+				})]);
+			} catch {
+				// Graceful cleanup is best-effort; termination below is unconditional.
+			} finally {
+				clearTimeout(timer);
+				this.shutdown(new Error('Engine disposed'));
+			}
+		})();
+		return this.disposal;
 	}
 }
 

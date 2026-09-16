@@ -41,7 +41,7 @@ export interface LabOptions {
 	/**
 	 * The fixed prompt re-asked after every burst, as token IDs. Encode it once
 	 * in the application layer with `encodePrompt()` from tokens.ts — this lab
-	 * accepts IDs only, so no path exists from free text into model execution.
+	 * accepts validated IDs rather than owning a tokenizer.
 	 */
 	autoPromptTokens?: readonly number[];
 	/** Called after any observable field changes. */
@@ -140,8 +140,7 @@ export class TwinLab {
 			});
 			this.engine = engine;
 
-			// Superseded from here on means: hand the device back. A worker dropped
-			// without dispose() keeps its GPU device and the next boot waits forever.
+			// Superseded boots must release their workers and device resources.
 			const superseded = () => {
 				if (myGen === this.gen) return false;
 				if (this.engine === engine) this.engine = null;
@@ -314,8 +313,8 @@ export class TwinLab {
 
 	// ── sampling ──────────────────────────────────────────────────────────────
 
-	/** The fixed question, asked every burst: same prompt, same temperature, so
-	 *  the only thing that changes between samples is the weights. */
+	/** A fixed prompt and temperature make samples easier to compare. Sampling
+	 *  still uses RNG state; use fixed sampling seeds for a controlled comparison. */
 	private autoSample(): Promise<void> {
 		const p = this.writeSample(this.opts.autoPromptTokens ?? [], 0.8);
 		this.samplePromise = p;

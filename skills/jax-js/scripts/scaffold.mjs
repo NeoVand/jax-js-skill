@@ -52,7 +52,7 @@ write(
 			version: '0.1.0',
 			type: 'module',
 			scripts: { dev: 'vite', build: 'vite build', preview: 'vite preview' },
-			dependencies: { '@jax-js/jax': '^0.1.21', '@jax-js/optax': '^0.1.2' },
+			dependencies: { '@jax-js/jax': '^0.1.24', '@jax-js/optax': '^0.1.2' },
 			devDependencies: { typescript: '^5.9.0', vite: '^7.0.0' }
 		},
 		null,
@@ -174,6 +174,7 @@ let stopRequested = false, step = 0, device = 'none';
 
 const handlers: Record<string, (r: RpcRequest) => unknown | Promise<unknown>> = {
 	async init(req) {
+		if (params) handlers.dispose({ id: req.id, op: 'dispose' });
 		const devices = await init();
 		// wasm is often FASTER than webgpu for small models — measure yours.
 		device = devices.includes('webgpu') ? 'webgpu' : devices.includes('wasm') ? 'wasm' : 'cpu';
@@ -215,15 +216,15 @@ const handlers: Record<string, (r: RpcRequest) => unknown | Promise<unknown>> = 
 		return { y: buf.buffer, __transfer: [buf.buffer] };
 	},
 	dispose() {
-		tree.dispose(params); tree.dispose(optState);
+		if (params) tree.dispose(params);
+		if (optState) tree.dispose(optState);
 		x?.dispose(); y?.dispose(); jitStep?.dispose(); jitPredict?.dispose();
-		params = optState = x = y = null;
+		params = optState = x = y = jitStep = jitPredict = null;
 		return {};
 	}
 };
 
-self.onmessage = async (e: MessageEvent<RpcRequest>) => {
-	const req = e.data;
+async function dispatch(req: RpcRequest) {
 	try {
 		const h = handlers[req.op];
 		if (!h) throw new Error(\`unknown op: \${req.op}\`);
@@ -235,13 +236,24 @@ self.onmessage = async (e: MessageEvent<RpcRequest>) => {
 		post({ id: req.id, ok: false,
 			error: err instanceof Error ? \`\${err.name}: \${err.message}\` : String(err) });
 	}
+}
+let queue = Promise.resolve();
+self.onmessage = (e: MessageEvent<RpcRequest>) => {
+	const req = e.data;
+	if (req.op === 'stop') {
+		stopRequested = true;
+		post({ id: req.id, ok: true, result: {} });
+		return;
+	}
+	if (req.op === 'dispose') stopRequested = true;
+	queue = queue.then(() => dispatch(req));
 };
 `
 	);
 
 	write(
 		'src/engine.ts',
-		`// Main-thread promise RPC. A plain class — never put this in reactive state.
+		`// Main-thread promise RPC. Keep this resource handle separate from UI metrics.
 export interface Metrics { step: number; loss: number; stepMs: number }
 interface Pending { resolve: (v: unknown) => void; reject: (e: Error) => void;
 	onMetrics?: (m: Metrics) => void }
@@ -250,6 +262,8 @@ export class Engine {
 	private worker: Worker;
 	private pending = new Map<number, Pending>();
 	private nextId = 1;
+	private closed = false;
+	private disposal: Promise<void> | null = null;
 	device = 'unknown';
 	paramCount = 0;
 
@@ -264,18 +278,41 @@ export class Engine {
 			msg.ok ? p.resolve(msg.result) : p.reject(new Error(msg.error));
 		};
 		this.worker.onerror = (e) => {
-			const err = new Error(e.message || 'worker error');
-			for (const p of this.pending.values()) p.reject(err);
-			this.pending.clear();
+			this.shutdown(new Error(e.message || 'worker error'));
 		};
+		this.worker.onmessageerror = () => this.shutdown(new Error('worker message could not be decoded'));
 	}
 
-	private call<T>(op: string, payload: Record<string, unknown> = {},
-		transfer: Transferable[] = [], onMetrics?: (m: Metrics) => void): Promise<T> {
+	private rejectPending(error: Error, exceptId?: number) {
+		for (const [id, request] of this.pending) {
+			if (id === exceptId) continue;
+			this.pending.delete(id);
+			request.reject(error);
+		}
+	}
+
+	private shutdown(error: Error) {
+		this.closed = true;
+		this.rejectPending(error);
+		this.worker.terminate();
+	}
+
+	private call<T>(
+		op: string,
+		payload: Record<string, unknown> = {},
+		transfer: Transferable[] = [],
+		onMetrics?: (m: Metrics) => void
+	): Promise<T> {
+		if (this.closed) return Promise.reject(new Error('Engine disposed or closed'));
 		const id = this.nextId++;
 		return new Promise<T>((resolve, reject) => {
 			this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, onMetrics });
-			this.worker.postMessage({ id, op, ...payload }, transfer);
+			try {
+				this.worker.postMessage({ id, op, ...payload }, transfer);
+			} catch (error) {
+				this.pending.delete(id);
+				reject(error);
+			}
 		});
 	}
 
@@ -294,9 +331,29 @@ export class Engine {
 		const r = await this.call<{ y: ArrayBuffer }>('predict');
 		return new Float32Array(r.y);
 	}
-	async dispose() {
-		try { await Promise.race([this.call('dispose'), new Promise((r) => setTimeout(r, 400))]); }
-		finally { this.worker.terminate(); this.pending.clear(); }
+	/** Compilation can delay a graceful reply. Bound cleanup, reject callers,
+	 *  and terminate even when the worker cannot process its disposal request. */
+	dispose(): Promise<void> {
+		if (this.disposal) return this.disposal;
+		if (this.closed) return Promise.resolve();
+		const disposeId = this.nextId;
+		const reply = this.call('dispose');
+		this.closed = true;
+		this.rejectPending(new Error('Engine disposed'), disposeId);
+		this.disposal = (async () => {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			try {
+				await Promise.race([reply, new Promise<void>((resolve) => {
+					timer = setTimeout(resolve, 400);
+				})]);
+			} catch {
+				// Graceful cleanup is best-effort; termination below is unconditional.
+			} finally {
+				clearTimeout(timer);
+				this.shutdown(new Error('Engine disposed'));
+			}
+		})();
+		return this.disposal;
 	}
 }
 `
@@ -321,9 +378,11 @@ for (let i = 0; i < N; i++) {
 
 const cfg = { layers: [1, 32, 32, 1], activation: 'tanh', loss: 'mse', seed: 7 };
 
-// A plain field, not framework state — it holds a Worker.
+// Resource handle separate from the values rendered in the page.
 let engine: Engine | null = null;
 let playing = false;
+let run = 0;
+go.disabled = true;
 
 function draw(pred: Float32Array) {
 	const dpr = Math.min(2, window.devicePixelRatio || 1);
@@ -350,26 +409,58 @@ function draw(pred: Float32Array) {
 }
 
 async function boot() {
-	engine = new Engine();
-	await engine.init(cfg, xs, ys, N, 5e-3);
-	out.textContent = \`device: \${engine.device} · \${engine.paramCount} params\`;
-	draw(await engine.predict());
+	const e = new Engine();
+	engine = e;
+	try {
+		await e.init(cfg, xs, ys, N, 5e-3);
+		if (engine !== e) return;
+		const predicted = await e.predict();
+		if (engine !== e) return;
+		out.textContent = \`device: \${e.device} · \${e.paramCount} params\`;
+		draw(predicted);
+		go.disabled = false;
+	} catch (error) {
+		if (engine !== e) return;
+		engine = null;
+		void e.dispose();
+		out.textContent = String(error);
+	}
 }
 
 go.addEventListener('click', async () => {
-	if (!engine) return;
-	if (playing) { playing = false; await engine.stop(); go.textContent = 'Train'; return; }
+	const e = engine;
+	if (!e) return;
+	const myRun = ++run;
+	if (playing) {
+		playing = false;
+		await e.stop().catch(() => {});
+		if (engine === e && myRun === run) go.textContent = 'Train';
+		return;
+	}
 	playing = true; go.textContent = 'Pause';
-	while (playing && engine) {
-		await engine.train(50, (m) => {
-			status.textContent = \`step \${m.step} · loss \${m.loss.toFixed(5)} · \${m.stepMs.toFixed(1)} ms\`;
-		});
-		if (!playing || !engine) break;
-		draw(await engine.predict());
+	try {
+		while (playing && engine === e && myRun === run) {
+			await e.train(50, (m) => {
+				if (engine !== e || myRun !== run) return;
+				status.textContent = \`step \${m.step} · loss \${m.loss.toFixed(5)} · \${m.stepMs.toFixed(1)} ms\`;
+			});
+			if (!playing || engine !== e || myRun !== run) break;
+			const predicted = await e.predict();
+			if (engine !== e || myRun !== run) return;
+			draw(predicted);
+		}
+	} catch (error) {
+		if (engine !== e || myRun !== run) return;
+		playing = false; go.textContent = 'Train';
+		out.textContent = String(error);
 	}
 });
 
-window.addEventListener('pagehide', () => { playing = false; void engine?.dispose(); });
+window.addEventListener('pagehide', () => {
+	playing = false; run++;
+	const e = engine; engine = null;
+	void e?.dispose();
+});
 void boot();
 `
 	);

@@ -1,11 +1,13 @@
 # Performance
 
-All numbers below were measured with the skill repo's
+Historical measurements below used **jax-js 0.1.21 + optax 0.1.2**, before the
+current 0.1.24 verification. They were measured with the skill repo's
 [examples/bench.html](https://github.com/NeoVand/jax-js-skill/blob/main/examples/bench.html) in Chrome 148 on an
 Apple Silicon Mac (Metal-3 adapter, hardware — not a fallback). **Run it on your
 own machine before quoting any of them**; absolute times vary by an order of
 magnitude between GPUs, and the first run of anything is dominated by shader
-compilation and GPU clock-up. The *ratios* are what transfer.
+compilation and GPU clock-up. Ratios also depend on hardware, browser, shapes
+and package versions; these tables are hypotheses to test, not thresholds.
 
 ```bash
 cd examples && npm install && npm run dev   # then open /bench.html
@@ -29,7 +31,7 @@ The win grows as the model gets *smaller relative to the number of tensors*,
 because it is latency, not arithmetic. But even on a real transformer it is
 nearly 3× on WebGPU.
 
-Use `templates/fused-adam.ts`. It converges bit-for-bit with optax's Adam
+Use `templates/fused-adam.ts`. Its numerical results match optax's Adam within the test's floating-point tolerances
 (asserted in [tests/api.test.mjs](https://github.com/NeoVand/jax-js-skill/blob/main/tests/api.test.mjs)). Keep optax when you need its schedules,
 chains or weight decay and the step is already long.
 
@@ -48,24 +50,19 @@ And with the fused optimizer, as the model grows:
 | 4×192, V=256 | 1.89M | 214 ms | **25 ms** |
 | 6×256, V=1024 | 5.28M | 570 ms | **56 ms** |
 
-Conclusions that hold across runs:
+These runs show that small workloads can favor wasm while larger matrix
+operations benefit from WebGPU. Parameter count alone does not determine the
+crossover: batch size, sequence length, tensor count and dispatch overhead also
+matter. Benchmark the actual model; keep CPU for small diagnostics and tests.
 
-- **`cpu` is unusable** for anything but a scalar demo — 100–200× slower than
-  wasm. Never `defaultDevice('cpu')` deliberately.
-- **`webgl` is a distant third.** Treat it as a last resort, not a fallback tier.
-- **wasm is genuinely good** — it matches OpenBLAS on Apple Silicon — and it
-  *ties or beats WebGPU below ~100k parameters*, where dispatch latency dominates.
-  So a small MLP demo needs no GPU at all, and a no-WebGPU fallback for one is
-  honest rather than a consolation prize.
-- **WebGPU pulls away fast above ~250k parameters**: 1.8× at 0.24M, 8.6× at
-  1.9M, 10× at 5.3M. A 5M-parameter transformer at 56 ms/step is interactive.
+A practical starting fallback is WebGPU → wasm → CPU (only if the workload is
+small enough). Report the selected device and avoid promising real-time speed
+before measurement.
 
-Practical fallback chain: `webgpu → wasm`, and tell the user which they got.
-
-## 3. Sync every step. Do not let the queue run ahead.
+## 3. Measure synchronization cadence
 
 Intuition says batching GPU work and blocking once at the end should be faster.
-It is not — measured at 0.1.21, on every backend:
+The opposite happened in this 0.1.21 benchmark:
 
 | Backend | sync every step | sync every 10 steps |
 | --- | --- | --- |
@@ -75,29 +72,33 @@ It is not — measured at 0.1.21, on every backend:
 
 Reading the loss every step is ~1.8× *faster* than letting ten steps queue up.
 This reproduces [jax-js issue #151](https://github.com/ekzhang/jax-js/issues/151),
-which is closed for want of a reduction rather than fixed. So: read the loss
-every step, and use burst size for pacing instead.
+which is now closed as not planned. That status does not establish behavior on
+every device or release. Start with a per-step scalar readback for simple
+bounded execution; benchmark less frequent synchronization on the target.
+Always await actual completion when timing, consume or dispose every loss, and
+yield so stop messages can be processed. Version 0.1.23 also changed Firefox
+completion polling, another reason to remeasure.
 
 ## 4. Where the rest of the time goes
 
 **jit compilation.** The first call with a given shape signature compiles. That
 is seconds for a transformer. It is also why changing shapes is so expensive —
-pad instead. Warm the compile during boot (run one step before showing "ready")
-so the user's first click is not the slow one.
+pad instead. Expose a "compiling" phase or warm a representative call during boot. If a
+warm-up updates weights or optimizer state, count it as training or restore all
+state afterward; the displayed untrained baseline must really be untrained.
 
 **One-hot embeddings.** `nn.oneHot(ids, V)` for a batch is `B·S·V` floats:
 8 × 96 × 24 is trivial, 8 × 256 × 8000 is 16M floats per step and will hurt.
-This is the real ceiling on vocabulary size in the browser, and the reason
-character and small word-piece vocabularies dominate in-browser LMs. Build the
-one-hots outside the jitted function so they are not retraced.
+Budget this explicitly along with gradients and activations. Building one-hots
+outside `jit` matches these templates; it is the input signatures, not where
+one-hot is called, that determine retracing.
 
 **Readback.** `dataSync()` blocks the thread until the GPU drains. On the main
 thread that is a dropped frame; in a worker it is fine. Read only what you draw:
 one loss scalar per step, not the whole logits tensor.
 
 **Transfers.** Move `ArrayBuffer`s between worker and page with the transfer
-list, never by structured clone. A 20 MB checkpoint copies in ~10 ms and
-transfers in ~0.
+list, never by structured clone. Transfer avoids the structured-clone buffer copy; GPU readback and upload still cost time.
 
 ## 5. Making it *feel* fast
 
@@ -106,9 +107,9 @@ micro-optimisation:
 
 - **Train in a worker.** Measured faster than the main thread, and the page
   keeps painting. See [workers.md](workers.md).
-- **Sample from a second worker.** Otherwise every specimen the UI asks for
-  stops training for its duration, and the loss curve stutters. See
-  [the twin-worker courier](workers.md#the-twin-worker-courier--the-big-win).
+- **Consider a second worker for expensive concurrent inference.** Compare the
+  added memory and checkpoint traffic with pausing one worker between bursts. See
+  [the twin-worker courier](workers.md#the-twin-worker-courier--optional-concurrent-inference).
 
 Then pace deliberately: bursts of 25–50 steps, an eval between bursts, one paint
 per animation frame. A model that steps at 10 ms but repaints the DOM 100 times
@@ -121,8 +122,7 @@ a second is slower than one that steps at 15 ms and repaints 60 times.
    1000× the median. Fix by padding to fixed shapes.
 3. Are you reading back more than one scalar per step?
 4. Is the batch one-hot bigger than the model?
-5. Is the model big enough to deserve WebGPU at all? Below ~100k parameters,
-   wasm is faster.
+5. Have you compared wasm and WebGPU on the actual workload?
 6. Is the UI re-rendering per step instead of per frame?
 7. Is the first-step compile being counted in your average? Report medians after
    warm-up.

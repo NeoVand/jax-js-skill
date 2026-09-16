@@ -1,23 +1,19 @@
 ---
 name: jax-js
-description: Build and train real neural networks in the browser with jax-js (@jax-js/jax) on WebGPU — autodiff, jit, optax optimizers, Web Worker training loops, and interfaces that stay at 60fps while training. Use for any task involving jax-js, @jax-js/jax, @jax-js/optax, "JAX in the browser", client-side or in-browser model training, WebGPU machine learning, or interactive ML demos (MLP, CNN, transformer, autoencoder, VAE, policy gradient, GRPO/RLVR) that run entirely on the user's own GPU.
+description: Build, train, evaluate and debug neural networks in the browser with jax-js (@jax-js/jax) and @jax-js/optax on WebGPU or WebAssembly. Use for JaxJS APIs, autodiff and jit, array ownership, worker-based training, browser ML demos, transformers, autoencoders, latent world models and learned control. Includes tested version-specific workarounds, responsive interfaces, and checks that distinguish falling loss from useful learning.
 license: MIT
 ---
 
-# jax-js — real training, in the browser
+# jax-js — training in the browser
 
-jax-js gives you JAX's semantics in TypeScript — `numpy` arrays, `grad`, `jit`,
-`vmap`, pytrees, `optax` optimizers — compiled to WebGPU, WebAssembly, WebGL or
-plain CPU. No Python, no server, no upload. A 5M-parameter transformer trains at
-interactive speed on a laptop GPU, and the weights never leave the page.
+jax-js provides JAX-style arrays, autodiff, `jit`, `vmap` and pytrees in
+TypeScript. Parameters are plain trees of arrays; you differentiate a loss
+function. Training and inference can stay entirely on the user's device.
 
-It is not TensorFlow.js. There is no `Model.fit()`, no layer objects, no
-`tensor.clone()`. Parameters are plain JS objects of arrays; a training step is a
-function you differentiate. **And arrays are moved, not shared** — this is the
-one thing that breaks every newcomer, including agents. Read the five laws before
-writing a line.
-
----
+**Verified 2026-09-16 with `@jax-js/jax` 0.1.24 and `@jax-js/optax` 0.1.2.**
+Inspect the target project's installed versions first. Do not silently upgrade
+an existing application to match this skill. Run the doctor after upgrades;
+release notes and unreleased source are not substitutes for checking npm builds.
 
 ## Setup
 
@@ -26,293 +22,253 @@ npm i @jax-js/jax @jax-js/optax
 ```
 
 ```ts
-import { init, defaultDevice, numpy as np, nn, jit, valueAndGrad, tree, random } from '@jax-js/jax';
+import { init, defaultDevice, numpy as np, nn, jit, valueAndGrad, tree } from '@jax-js/jax';
 import { adam, applyUpdates } from '@jax-js/optax';
 
-const devices = await init();                 // ['cpu','wasm','webgl','webgpu'] — what this browser has
-defaultDevice(devices.includes('webgpu') ? 'webgpu' : 'wasm');
+const available = await init();
+const device = available.includes('webgpu') ? 'webgpu'
+  : available.includes('wasm') ? 'wasm' : 'cpu';
+defaultDevice(device);
 ```
 
-Choose `webgpu → wasm` and skip the rest: `cpu` is 100–200× slower than wasm and
-`webgl` is a distant third. Below ~100k parameters wasm actually **ties or beats
-WebGPU** (dispatch latency dominates), so a small demo needs no GPU at all;
-above ~250k WebGPU pulls away fast — 10× at 5M parameters. Measured numbers in
-[references/performance.md](references/performance.md).
+Initialize before creating arrays, inside the worker that owns them. Use CPU
+for small diagnostics; wasm can outperform WebGPU on small workloads. Measure
+the actual shapes and device before promising interactive training. See
+[performance.md](references/performance.md) for benchmark methodology and
+explicitly historical measurements.
 
-`init()` must finish before any array is created. In a Web Worker, `init()` and
-`defaultDevice()` are called inside the worker — devices do not cross threads.
-
-**Configure Vite before you write the worker.** jax-js lazily imports its
-wasm/webgpu backends, so a worker that uses it needs code-splitting. Vite's
-default worker format cannot do that: the dev server works and `vite build`
-fails with `Invalid value "iife" for option "worker.format"`.
+Vite workers need ES-module output because jax-js lazily imports backends:
 
 ```ts
 // vite.config.ts
+import { defineConfig } from 'vite';
 export default defineConfig({
   worker: { format: 'es' },
   optimizeDeps: { include: ['@jax-js/jax', '@jax-js/optax'] },
 });
 ```
 
-Feature-detect before promising a GPU (`navigator.gpu` exists but
-`requestAdapter()` can still return null, and a wedged GPU process never answers
-at all):
+Always check a production build: dev can work while the default `iife` worker
+format fails. Feature-detect WebGPU in a secure context (HTTPS or localhost),
+then check actual initialization; `navigator.gpu` alone is not proof of a usable
+adapter. Put a deadline around boot and provide a retry or a practical fallback.
+
+## Five core rules
+
+### 1. Array operations consume inputs. Use `.ref` for another use.
 
 ```ts
-export async function detectWebGPU(): Promise<boolean> {
-  if (typeof navigator === 'undefined' || !navigator.gpu) return false;
-  try {
-    const adapter = await Promise.race([
-      navigator.gpu.requestAdapter(),
-      new Promise<null>((r) => setTimeout(() => r(null), 8000)),   // silence = no
-    ]);
-    return adapter !== null;
-  } catch { return false; }
-}
+const x = np.array([1, 2, 3]);
+np.sum(x.ref).item(); // extra use
+np.sum(x).item();     // final use
+// np.sum(x) now throws: the array was consumed
 ```
 
----
+Methods consume receivers and array operands (`x.add(y)` consumes both).
+Count uses, lend `.ref` on all but the last, and dispose unused results.
+`tree.ref(params)` retains every leaf; `tree.dispose(params)` releases them.
+Metadata (`shape`, `size`, `dtype`) and tree traversal (`leaves`, `flatten`)
+do not consume arrays; a `tree.map` callback may.
 
-## The five laws
+**`.ref` is neither a buffer copy nor a gradient detach.** Use
+`lax.stopGradient` only where the objective calls for it. A target branch is not
+automatically detached just because it is called a target. Details and leak
+patterns: [memory.md](references/memory.md).
 
-### 1. Every array is consumed exactly once. Use `.ref` to lend a second use.
+### 2. Reading a value consumes it. Never dispose the same use afterward.
 
-Passing an array to any operation **moves** it. Touching it again throws
-`Referenced tracer ... freed, please use .ref move semantics`.
-
-```ts
-const a = np.array([1, 2, 3]);
-np.sum(a);            // a is now GONE
-np.sum(a);            // ✗ ReferenceError
-
-const b = np.array([1, 2, 3]);
-np.sum(b.ref).item(); // ✓ lends one use
-np.sum(b).item();     // ✓ final use consumes it
-```
-
-This applies to *everything* that takes an array: `np.*` functions, method calls
-(`x.add(y)` consumes both `x` and `y`), `nn.*`, `np.zerosLike(a)`, jitted
-functions, `solver.update(...)`, `applyUpdates(...)`.
-
-Counting rule: **count the uses of a value in a scope; add `.ref` to all but the
-last.** For pytrees use `tree.ref(params)` and free with `tree.dispose(params)`.
-
-```ts
-// params is used twice → ref the first
-const [loss, grads] = jitStep(tree.ref(params), batch);
-const [updates, next] = solver.update(grads, optState, tree.ref(params));
-params = applyUpdates(params, updates);   // last use, consumes
-```
-
-### 2. Reading a value consumes it. Never `dispose()` afterwards.
-
-`.item()`, `.js()`, `.dataSync()` and `await .data()` **all consume**.
+`.item()`, `.js()`, `.dataSync()` and `await .data()` all consume.
 `blockUntilReady()` does not.
 
 ```ts
-const l = lossVal.item();       // lossVal is gone — do NOT call lossVal.dispose()
-const keep = lossVal.ref.item(); // read a copy if you still need the array
+const preview = lossVal.ref.item(); // retained lossVal remains usable
+const final = lossVal.item();       // consumes its final use; no dispose
 ```
 
-The most common jax-js bug in agent-written code is `x.item(); x.dispose();` —
-a double free. If a loss is only *sometimes* read, dispose it in the other branch:
+If the loss is only sometimes read, dispose it in the other branch:
 
 ```ts
 if (step % 50 === 0) log(lossVal.item());
 else lossVal.dispose();
 ```
 
-### 3. `jit` the step, keep shapes constant, pass params as arguments.
+### 3. Jit hot paths, keep shapes stable, pass changing values as arguments.
 
-`jit` traces once per distinct input **shape/dtype signature** and caches the
-compiled kernel. Two consequences:
-
-- **Pad variable-length inputs to a fixed block size.** A generation loop that
-  grows the prompt by one token per step will recompile on every step. Right-pad
-  to `blockSize` instead; causal attention makes the padding irrelevant.
-- **Never close over params.** A jitted closure bakes them in as trace-time
-  constants and your model will never improve — the loss curve goes flat and
-  looks like a learning-rate bug.
+`jit` caches traces by input signature, including shape/dtype and static values.
+Pass params explicitly; closure-captured arrays are frozen at trace time:
 
 ```ts
-// ✗ params baked in at trace time — samples never change
-const bad = jit((tok, pos) => forward(params, tok, pos));
-
-// ✓ params flow in as an argument
-const good = jit((p, tok, pos) => forward(p, tok, pos));
-good(tree.ref(params), tok, pos);
+const forward = jit((p, tok, pos) => model(p, tok, pos));
+forward(tree.ref(params), tok, pos);
 ```
 
-`jit()` returns an *owned* function; call `.dispose()` on it when the model is
-torn down. `staticArgnums` recompiles for **every distinct value** — never pass a
-step counter through it.
+Pad variable-length prompts to a fixed block size and read the last real token's
+logits. Right padding does not affect earlier rows under causal attention;
+exclude padding from losses. Use eager execution for debugging when useful.
 
-### 4. Embeddings are one-hot matmuls, not `np.take`.
+`staticArgnums` retraces per distinct value: do not put step counters or frequently
+changing learning rates there. Pass dynamic scalars as arrays when needed.
+Dispose owned jitted functions at teardown.
 
-Gather has a backward pass in eager mode, but **`grad` through `np.take` fails
-inside `jit`** (`routine primitive scatter input is not imm`, verified on
-0.1.21). Since everything trainable must be jitted, embeddings are:
+### 4. Verify differentiated indexing; use one-hot embeddings where needed.
+
+On 0.1.24, the tested `jit(grad(...np.take...))` path still fails with
+`routine primitive scatter input is not imm`. Eager gather gradients work.
+The template's compiled embedding path uses:
 
 ```ts
-const tokenOH = nn.oneHot(inputIds, vocab);        // [B, S, V]
-let x = np.dot(tokenOH.reshape([-1, vocab]), params.wte);   // [B·S, D]
+const tokenOH = nn.oneHot(inputIds, vocab); // [B, S, V]
+const x = np.dot(tokenOH.reshape([-1, vocab]), params.wte); // [B·S, D]
 ```
 
-Build the one-hot **outside** the jitted function and pass it in. This costs
-`B·S·V` floats, which is fine to a vocab of a few thousand — the right ceiling
-for an in-browser model anyway. `np.take` is still correct for inference-only
-paths and for indexing that is never differentiated.
+Build one-hots outside the step as the templates do. Budget `4·B·S·V` bytes
+for each float32 one-hot tensor; inputs and targets may both need one.
+This workaround is version-specific, not an architectural requirement.
+`np.take` remains suitable for inference-only or non-differentiated paths.
 
-### 5. Train in a Worker. Sample from a *second* Worker.
+### 5. Give training a worker and an explicit lifecycle.
 
-Training on the main thread janks the page even on WebGPU, because readbacks
-block. Put the model in a Web Worker behind a small RPC — measured *faster* than
-the main thread, with the UI at 60fps.
+Use a worker for sustained training so dispatch, compilation and readbacks do
+not block the UI. Yield between short bursts so stop requests can arrive.
+**Async message handlers can overlap across `await`**: serialize model operations
+and let stop set a cancellation flag outside that queue.
 
-Then: any inference the UI wants **while training runs** (a text sample, a board
-evaluation, an attention map) must not stop the training loop. Boot a second
-worker, courier a checkpoint to it after each burst, and let it answer queries on
-its own GPU device while the trainer keeps stepping. This is the single biggest
-perceived-performance win in an interactive ML page — see
-[references/workers.md](references/workers.md).
+One worker is sufficient when inference runs between bursts or while paused.
+Use a second worker for expensive concurrent inference only when measurements
+justify duplicated weights, caches, buffers and checkpoint traffic. Label its
+outputs with the checkpoint step they actually used.
 
----
+Disposal must stop accepting work, reject pending RPCs and terminate the worker
+after a bounded graceful attempt. Generation counters prevent late results from
+writing into a reset or unmounted UI. See [workers.md](references/workers.md).
 
-## The training step, three ways
+## Training step
 
-Pick by how much you need. All three are verified in the skill repo's
-[tests/api.test.mjs](https://github.com/NeoVand/jax-js-skill/blob/main/tests/api.test.mjs).
-
-**A. Default — `jit` the loss+grad, run optax outside.** Correct, fast enough for
-almost everything, and the only option if you want optax's schedules or chains.
+**Default: jit loss and gradients; use Optax Adam outside jit.**
 
 ```ts
-const jitStep = jit((p: any, x: any, y: any) =>
-  valueAndGrad((pp: any) => lossFn(pp, x, y))(p));
-
+const jitStep = jit((p, x, y) =>
+  valueAndGrad((pp) => lossFn(pp, x, y))(p));
 const solver = adam(3e-4, { b1: 0.9, b2: 0.99 });
 let optState = solver.init(tree.ref(params));
 
 for (let i = 0; i < steps; i++) {
-  const { x, y } = nextBatch();                              // fresh device arrays
+  const { x, y } = nextBatch(); // fresh owned arrays
   const [lossVal, grads] = jitStep(tree.ref(params), x, y);
   const [updates, nextState] = solver.update(grads, optState, tree.ref(params));
   params = applyUpdates(params, updates);
   optState = nextState;
-  loss = lossVal.item();                                     // consumes; no dispose
+  const loss = lossVal.item(); // consumes; no dispose
+  record(loss);
 }
 ```
 
-> `@jax-js/optax@0.1.2` **cannot be placed inside `jit`** — its Adam bias
-> correction calls `count.item()`, a host readback, and jit throws
-> `count.item is not a function`. Keep `solver.update`/`applyUpdates` outside.
+`@jax-js/optax@0.1.2` Adam calls `count.item()` for bias correction, so the
+compiled path throws `count.item is not a function`. This is a published-package
+limitation; an upstream source fix does not update an already installed package.
+Other transformations need their own compatibility checks.
 
-**B. Fastest — fuse the optimizer into the jitted step by hand.** Measured
-**2.9× faster on a 235k-parameter transformer on WebGPU** (26.7 → 9.2 ms/step)
-and up to 6× on small MLPs, because optax outside `jit` spends most of the step
-on per-tensor kernel-dispatch latency. Use `templates/fused-adam.ts`; it
-converges bit-for-bit with optax's Adam. Bias-correction constants go in as
-**device scalars**, not `staticArgnums`, so the kernel is traced once. Reach for
-this whenever the step time matters — see [references/performance.md](references/performance.md).
+If optimizer dispatch is a measured bottleneck, use `templates/fused-adam.ts`.
+Its device-scalar bias corrections avoid per-step retracing, and its results
+are tested against Optax within floating-point tolerances. Match the intended
+optimizer's clipping, schedules and decay before replacing it. Plain SGD is
+also appropriate for small teaching examples.
 
-**C. Simplest — no optimizer at all.** For teaching demos and 2-parameter
-landscapes, `valueAndGrad` plus `x = x.sub(g.mul(lr))` is the whole story and
-reads beautifully.
+Changing Adam's learning rate need not reset moments: retain compatible
+`optState` when rebuilding the transformation, or use a schedule. Calling
+`solver.init` resets state; loading a weights-only checkpoint does not restore it.
 
-### Pacing
+### Pacing and measurement
 
-Run in bursts (25–50 steps), then yield. A tight `for` loop starves the worker's
-own message queue, so a `stop` message never arrives:
+Start with a scalar loss read each step and yield every few updates:
 
 ```ts
-for (let i = 0; i < steps; i++) {
-  if (stopRequested) break;
-  trainStep();
-  if (i % 4 === 3) await new Promise((r) => setTimeout(r, 0));  // let 'stop' land
-}
+if (stopRequested) break;
+trainStep();
+if (i % 4 === 3) await new Promise((resolve) => setTimeout(resolve, 0));
 ```
 
-Sync the loss **every step**. Letting steps queue up and blocking once at the end
-measures ~2× *slower* on WebGPU, not faster (upstream issue #151, still open).
+Benchmark sync frequency on the target. A historical run found per-step sync
+faster than every ten steps, but that is not a universal GPU rule. Time completed
+work, separate compile time from steady state, and report the backend. Keep
+training progress independent of `requestAnimationFrame`, which pauses in hidden
+tabs. Coalesce UI paints, not the worker's ability to receive cancellation.
 
----
+## Choose the app structure
 
-## Choosing a shape for the app
-
-| Situation | Build |
+| Situation | Starting point |
 | --- | --- |
-| Teaching script, one canvas, ≤100k params | Single module on the main thread; `await new Promise(r => setTimeout(r))` between bursts. `templates/standalone-lab.ts` |
-| Any real training (MLP on MNIST and up) | Worker + promise-RPC engine. `templates/worker.ts` + `templates/engine.ts` |
-| UI must stay live *during* training (sampling, probing, playing) | Twin workers: trainer + sampler, checkpoint couriered between them. [references/workers.md](references/workers.md) |
-| Framework UI (Svelte/React) | Engine in a module-level store; never put the engine in reactive state. [references/ui.md](references/ui.md) |
-
----
+| Tiny teaching script with bounded work | `templates/standalone-lab.ts`; yield and measure responsiveness |
+| Sustained training | `templates/worker.ts` + `templates/engine.ts` |
+| Expensive inference concurrent with training | `templates/twin-engine.ts`; compare against one worker |
+| Framework UI | Component/page-owned engine; reactive metrics, explicit cleanup. [ui.md](references/ui.md) |
+| World model or learned control | [world-models.md](references/world-models.md) before defining losses or displays |
 
 ## Reference index
 
-Read the file that matches the task; do not read them all.
+Read only the files needed for the task.
 
 | I need to… | Read |
 | --- | --- |
-| Look up an operator, dtype, random key, or shape rule | [references/api.md](references/api.md) |
-| Understand or debug ownership, leaks, `already freed` errors | [references/memory.md](references/memory.md) |
-| Structure the worker, the RPC, the twin-worker sampler | [references/workers.md](references/workers.md) |
-| Write an MLP, CNN, transformer, autoencoder or VAE | [references/models.md](references/models.md) |
-| Do RL: REINFORCE, policy gradient, GRPO/RLVR, DPO | [references/rl.md](references/rl.md) |
-| Build the UI: charts, canvases, controls, lifecycle, theming | [references/ui.md](references/ui.md) |
-| Make it faster, or find out why it is slow | [references/performance.md](references/performance.md) |
-| Fix an error message | [references/troubleshooting.md](references/troubleshooting.md) |
+| Look up operators, dtypes, random keys or shape rules | [api.md](references/api.md) |
+| Debug ownership, leaks or freed arrays | [memory.md](references/memory.md) |
+| Structure RPC, lifecycle and optional sampler workers | [workers.md](references/workers.md) |
+| Write an MLP, CNN, transformer, autoencoder or VAE | [models.md](references/models.md) |
+| Build policy-gradient or preference-training demos | [rl.md](references/rl.md) |
+| Teach with charts, controls, canvases and visible learning evidence | [ui.md](references/ui.md) |
+| Build and evaluate a latent world model | [world-models.md](references/world-models.md) |
+| Measure speed and resource costs | [performance.md](references/performance.md) |
+| Diagnose errors or stalled learning | [troubleshooting.md](references/troubleshooting.md) |
 
-## Templates
+## Templates and scripts
 
-Copy, don't retype. Each file is runnable and tested.
+Adapt the templates to the target application; UI examples need the documented
+host imports. Preserve ownership and lifecycle invariants, not arbitrary sizes
+or styling. API tests exercise model math; browser tests exercise worker demos.
 
-| File | What it is |
+| File | Purpose |
 | --- | --- |
-| `templates/standalone-lab.ts` | Whole training loop in one file: pytree params, `valueAndGrad`, Adam, canvas |
-| `templates/worker.ts` | Worker that owns the model; RPC dispatch, transferables, `stop` handling |
-| `templates/engine.ts` | Main-thread promise-RPC client with streaming metrics |
-| `templates/twin-engine.ts` | Trainer + sampler pair; checkpoint courier so training never pauses |
-| `templates/tokens.ts` | The token boundary: encode text in the app, hand the worker validated integer IDs |
-| `templates/model-mlp.ts` | Configurable MLP: activations, mse/xent, VAE bottleneck |
-| `templates/model-transformer.ts` | Decoder-only transformer: init, forward, loss, sampling, attention capture |
-| `templates/fused-adam.ts` | Optimizer fused inside `jit` |
-| `templates/ui-svelte5.svelte` | Svelte 5 runes plate: lifecycle, phases, loss chart, controls |
-| `templates/ui-react.tsx` | Same contract in React |
+| `templates/standalone-lab.ts` | Small complete training loop and canvas |
+| `templates/worker.ts` | Model owner, serialized RPC operations and stop |
+| `templates/engine.ts` | Promise RPC client with streaming metrics |
+| `templates/twin-engine.ts` | Optional trainer/sampler pair and checkpoint courier |
+| `templates/tokens.ts` | Validate token ranges and context length |
+| `templates/model-mlp.ts` | Configurable MLP, MSE/cross-entropy and VAE bottleneck |
+| `templates/model-transformer.ts` | Decoder, sampling, attention and residual capture |
+| `templates/fused-adam.ts` | Adam fused into a jitted step |
+| `templates/ui-svelte5.svelte` | Svelte lifecycle, loss chart and controls |
+| `templates/ui-react.tsx` | React lifecycle, loss chart and controls |
 
-## Scripts
+From the target project's directory, use the installed skill's actual path:
 
 ```bash
-node scripts/doctor.mjs            # verify jax-js version + API assumptions in this project
-node scripts/scaffold.mjs <dir>    # write a runnable vite + jax-js + worker starter
+node /path/to/jax-js/scripts/doctor.mjs
+node /path/to/jax-js/scripts/scaffold.mjs <new-directory>
 ```
 
----
+## Before saying it works
 
-## Before you say it works
-
-1. `node scripts/doctor.mjs` — passes on the installed version.
-2. Loss **goes down**. A flat curve almost always means params were captured by a
-   jit closure (law 3) or the learning rate is wrong for the init.
-3. No `Referenced tracer ... freed` in the console after 200+ steps.
-4. Memory is flat: log `np.Array` counts or watch the tab's memory across 1000
-   steps. A rising line means a missing `.dispose()` in a per-step path.
-5. The page still scrolls at 60fps while training.
-6. Non-WebGPU browsers get a real fallback (wasm for small models, honest prose
-   for large ones) — not a dead button.
+1. Run the doctor on installed packages and relevant numerical contract tests.
+2. Show training loss **and** fixed held-out evidence against a simple baseline.
+   Use matched seeds/data/checkpoints for comparisons. Falling loss alone can
+   hide representation collapse, leakage or a stale inference model.
+3. Check the real browser: train, pause, infer, reset, change settings, leave
+   during boot/training and revisit. Check errors and actual model behavior.
+4. Inspect long-run resource use and repeated teardown. Backend pools and jit
+   caches may grow during warm-up; investigate continued growth after shapes
+   stabilize. Audit array ownership rather than assuming JS GC releases it.
+5. Verify a production build, practical backend fallback, and responsive controls.
+6. Inspect the visual evidence in light/dark themes and at narrow widths. Diagrams,
+   equations, model inputs and captions must describe the computation that runs.
 
 ## Version notes
 
-Written against **`@jax-js/jax` 0.1.21** and **`@jax-js/optax` 0.1.2**
-(August 2026). Re-run `scripts/doctor.mjs` on upgrade; it asserts the specific
-behaviours the laws above depend on.
+0.1.22 fixes integer/boolean `mean` truncation and adds numerical helpers;
+0.1.23 adds APIs and changes Firefox completion polling; 0.1.24 adds `select`,
+`polyder` and NaN-aware operations. See [api.md](references/api.md) for details.
+The gather-gradient and published Adam workarounds were re-tested on 0.1.24 /
+0.1.2, not inferred from release notes.
 
-- 0.1.19 fixed eager-mode `grad` of matmul materialising an M×K×N intermediate,
-  and added gather/sort backprop via `scatter` — **eager only**; law 4 still
-  holds under `jit`.
-- optax has not been republished since January 2026, so the in-graph Adam bias
-  correction landed upstream is not yet on npm.
-
-Docs: <https://jax-js.com/docs/> · Repo: <https://github.com/ekzhang/jax-js> ·
-Feature matrix: `FEATURES.md` in that repo.
+Primary sources: [releases](https://github.com/ekzhang/jax-js/releases),
+[docs](https://jax-js.com/docs/),
+[feature matrix](https://github.com/ekzhang/jax-js/blob/main/FEATURES.md).

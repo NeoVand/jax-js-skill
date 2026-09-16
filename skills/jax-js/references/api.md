@@ -1,7 +1,7 @@
 # API surface
 
-Condensed from the `@jax-js/jax@0.1.21` type definitions. Everything consumes
-its array arguments — see [memory.md](memory.md).
+Condensed from the `@jax-js/jax@0.1.24` type definitions. Array operations generally consume
+their inputs; metadata and tree traversal do not — see [memory.md](memory.md).
 
 ## Top-level exports
 
@@ -86,9 +86,22 @@ meshgrid take takeAlongAxis`
 
 Linear algebra: `dot matmul matvec vecmat inner outer tensordot einsum trace`,
 plus `np.linalg.{inv, solve, det, slogdet, cholesky, svd, eigh, lstsq,
-matrixPower, vectorNorm, matrixNorm}`. **No QR, no `eig`, no `pinv`.**
+matrixPower, norm, vectorNorm, matrixNorm}`. **No QR, no `eig`, no `pinv`.**
 
-`np.fft.*` is complete and fast.
+Recent additions (0.1.22–0.1.24): `vsplit`, `diagflat`, `indices`, `geomspace`,
+`diff`, `ediff1d`, `trapezoid`, `polyval`, `polymul`, `polyder`, `unwrap`,
+`fromfunction`, `modf`, `select` and NaN-aware reductions/cumulative operations.
+Check installed type signatures; Python NumPy argument conventions are not
+always identical. For example, `np.linalg.norm(x, { ord, axis, keepdims })`
+takes an options object.
+
+Since 0.1.22, `mean` of integer or boolean inputs returns a fractional result
+instead of truncating. This matters for accuracy computed as the mean of a
+boolean correctness mask; cast to float explicitly on older versions.
+`np.nanmean` is useful for intentionally missing observations, not for hiding
+NaNs in a diverging model.
+
+`np.fft.*` provides FFT operations; see the installed types for supported forms.
 
 ## nn module
 
@@ -96,7 +109,7 @@ matrixPower, vectorNorm, matrixNorm}`. **No QR, no `eig`, no `pinv`.**
 nn.relu relu6 leakyRelu elu celu selu gelu silu/swish mish softplus squareplus
    sigmoid hardSigmoid hardSilu hardTanh logSigmoid softSign sparsePlus glu
 nn.softmax(x, axis)     nn.logSoftmax(x, axis)
-nn.logsumexp(x, axis)   nn.logmeanexp   nn.standardize
+nn.logsumexp(x, axis)   nn.logmeanexp   nn.log1mexp   nn.standardize
 nn.oneHot(ids, numClasses)
 nn.dotProductAttention(q, k, v, { isCausal?, mask?, scale?, bias? })
 ```
@@ -141,7 +154,7 @@ vmap(f, inAxes?)
 vjp(f, primals, { hasAux? })                            // → [out, vjpFn]
 jvp(f, primals, tangents)
 jacrev / jacfwd / jacobian / hessian / linearize
-lax.stopGradient(x)                                     // detach — PPO/DPO ratios
+lax.stopGradient(x)                                     // explicit gradient detach; .ref is not
 ```
 
 `argnums` selects which argument to differentiate (default 0); an array returns a
@@ -180,12 +193,15 @@ const warmupCosine = (peak: number, warmup: number, total: number) => (t: number
 const solver = adam(warmupCosine(3e-4, 100, 5000));
 ```
 
-**optax cannot run inside `jit`** at 0.1.2 — `treeBiasCorrection` calls
+**Optax Adam cannot run inside `jit`** at 0.1.2 — `treeBiasCorrection` calls
 `count.item()`. To fuse the optimizer into the compiled step, hand-roll it:
 `templates/fused-adam.ts`.
 
-Changing the learning rate mid-run means rebuilding the solver, which resets Adam
-moments. That is an honest cost — say so in the UI rather than hiding it.
+Optimizer state is passed explicitly. Rebuilding `adam(newLr)` with the same
+other options does **not** reset moments if you keep passing the existing
+`optState`. Calling `solver.init(...)` does reset them. A schedule is another
+way to vary the rate. Preserve state only across compatible optimizer/state
+structures; changing the chain or parameter shapes may require reinitializing.
 
 ## Not supported
 

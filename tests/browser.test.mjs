@@ -48,10 +48,11 @@ try {
 	const pageErrors = [];
 	page.on('pageerror', (e) => pageErrors.push(String(e)));
 
+	await page.goto(`http://localhost:${PORT}/`, { waitUntil: 'load' });
 	const hasGpu = await page.evaluate(async () => {
 		if (typeof navigator === 'undefined' || !navigator.gpu) return false;
 		try {
-			return (await navigator.gpu.requestAdapter()) !== null;
+			return (await Promise.race([navigator.gpu.requestAdapter(), new Promise((r) => setTimeout(() => r(null), 8000))])) !== null;
 		} catch {
 			return false;
 		}
@@ -136,6 +137,41 @@ try {
 		if (pageErrors.length) report('FAIL', 'gpt.html has no page errors', pageErrors[0]);
 		else report('PASS', 'gpt.html has no page errors');
 	}
+	// ── 3. real worker serialization, independent of the GPU-only demo ───────
+	// Stop the demo's workers before creating a small deterministic fixture.
+	await page.evaluate(() => window.lab?.disposeAll());
+	await page.goto(`http://localhost:${PORT}/`, { waitUntil: 'load' });
+	pageErrors.length = 0;
+	const lifecycle = await page.evaluate(async (enginePath) => {
+		const { Engine } = await import(enginePath);
+		const cfg = { nLayer: 1, nEmbd: 8, nHead: 2, blockSize: 8, vocab: 4 };
+		const tokens = Uint16Array.from({ length: 1024 }, (_, i) => i % 4);
+		const engine = new Engine({ tokenData: tokens, seed: 11 });
+		try {
+			await engine.init(cfg);
+			const initial = await engine.exportCheckpoint();
+			const training = engine.train(8, () => {});
+			// Arrives while training yields: must wait until all updates complete.
+			const loading = engine.loadWeights(initial.slice(0));
+			await Promise.all([training, loading]);
+			const restored = new Float32Array(await engine.exportCheckpoint());
+			const expected = new Float32Array(initial);
+			const exact = restored.length === expected.length && restored.every((v, i) => v === expected[i]);
+			let observed = 0;
+			const longRun = engine.train(1000, (m) => {
+				observed = m.step;
+				if (observed === 1) void engine.stop();
+			});
+			await longRun;
+			return { exact, observed, device: engine.device };
+		} finally { await engine.dispose(); }
+	}, `/@fs/${root}/skills/jax-js/templates/engine.ts`);
+	if (!lifecycle.exact) report('FAIL', 'worker serializes load after a yielding train');
+	else report('PASS', 'worker serializes load after a yielding train', `exact checkpoint restored on ${lifecycle.device}`);
+	if (!(lifecycle.observed > 0 && lifecycle.observed < 1000)) report('FAIL', 'stop interrupts a worker burst', JSON.stringify(lifecycle));
+	else report('PASS', 'stop interrupts a worker burst', `stopped at step ${lifecycle.observed}`);
+	if (pageErrors.length) report('FAIL', 'worker lifecycle has no page errors', pageErrors[0]);
+
 } finally {
 	await browser?.close();
 	server.kill('SIGTERM');

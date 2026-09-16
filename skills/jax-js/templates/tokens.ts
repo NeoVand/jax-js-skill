@@ -1,13 +1,10 @@
 // The token boundary.
 //
-// Nothing but validated integer token IDs crosses into a training worker. Free
-// text is encoded in the application layer, checked here, and only then handed
-// over — so there is no path from an arbitrary string into model execution, and
-// a malformed or out-of-range ID cannot reach nn.oneHot() and corrupt a batch.
-//
-// Both sides call this: the engine before postMessage, and the worker again on
-// receipt. The worker does not trust the main thread — that is the actual trust
-// boundary, and re-checking there costs a few microseconds.
+// These templates encode in the application layer and send integer IDs to the
+// worker. Both sides validate vocabulary bounds and context length to catch
+// malformed tensors and tokenizer/model mismatches. Other apps may tokenize in
+// the worker. Tokenization preserves text meaning; it is not a trust boundary
+// or a prompt-injection defense.
 
 /** Thrown when a caller hands over something that is not a token sequence. */
 export class InvalidTokensError extends Error {
@@ -57,10 +54,8 @@ export function toPromptTokens(ids: unknown, { vocab, maxLen }: TokenBounds): nu
 /**
  * Encode free text to token IDs and validate the result in one step.
  *
- * This is the ONLY place a string should become model input. Keeping it in the
- * application layer — never inside the worker or the engine — means the worker's
- * message contract is integers-only, and a static reading of the code finds no
- * route from arbitrary text to model execution.
+ * Application-layer convenience used by these templates. A worker may own its
+ * tokenizer instead; the integer bounds still need validation before one-hot.
  */
 export function encodePrompt(
 	text: string,

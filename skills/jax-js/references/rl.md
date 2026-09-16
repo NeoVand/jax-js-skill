@@ -67,7 +67,7 @@ function rlStep(seqs: Int32Array, advs: number[], starts: number[]) {
 Normalising by the number of credited tokens (rather than by `G`) keeps the
 gradient scale independent of how long the generations happen to be.
 
-## GRPO — group-relative advantages
+## Group-relative advantages (not a full GRPO implementation)
 
 Sample G continuations of the *same* prompt, score them, and standardise within
 the group. No value network, no critic:
@@ -78,6 +78,12 @@ const mean = rewards.reduce((a, b) => a + b, 0) / G;
 const sd = Math.sqrt(rewards.reduce((a, r) => a + (r - mean) ** 2, 0) / G) || 1;
 const advs = rewards.map((r) => (r - mean) / sd);       // group-relative
 ```
+
+The weighted cross-entropy step above is an on-policy REINFORCE-style update.
+Group normalization alone does not implement [GRPO's](https://arxiv.org/abs/2402.03300)
+clipped probability-ratio objective. If reusing sampled sequences for multiple updates, store the behavior
+policy log-probabilities and implement the intended ratio, clipping and KL
+terms. Label simplified demos by what they actually compute.
 
 If every sample in a group gets the same reward the advantages are all zero and
 the step is a no-op — that is correct, not a bug. Skip it and resample.
@@ -136,14 +142,16 @@ Plain REINFORCE will happily wander to a degenerate policy that scores well and
 writes nothing. Keep a frozen copy of the reference policy and add
 `β · KL(π ‖ π_ref)` to the loss.
 
-Cheapest honest version: keep `π_ref` in a *second worker* (the reference model
-never trains, so it can hold a frozen checkpoint), get its log-probs for the
-sampled sequences, and add the per-token difference as an extra weighted term.
-The twin-worker machinery in [workers.md](workers.md) is exactly the right
-shape for this — one worker trains, the other answers.
+A frozen reference can live in the same worker or a second worker when concurrent
+inference justifies it. Compute its log-probabilities without gradients. An exact
+categorical KL sums over the vocabulary under the current policy; a sampled
+log-probability difference is an estimator, and its gradient treatment depends
+on the chosen policy-gradient objective. Do not call an arbitrary weighted log
+ratio the full KL penalty. Match a cited objective and test its gradient.
 
-Without a KL term, say so. A demo that calls itself RLHF and has no reference
-model is misleading the reader.
+State whether the objective includes a reference-policy KL penalty. RLHF
+refers to learning from human feedback, not to the presence of one particular
+regularizer. Verifiable-reward demos should explain where the reward comes from.
 
 ## DPO
 

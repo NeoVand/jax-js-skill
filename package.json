@@ -6,13 +6,13 @@
 	"description": "An agent skill for building and training real neural networks in the browser with jax-js on WebGPU.",
 	"scripts": {
 		"test": "npm run test:api && npm run test:browser",
-		"test:api": "node --test tests/api.test.mjs",
+		"test:api": "node --test tests/api.test.mjs tests/rpc.test.mjs",
 		"test:browser": "node tests/browser.test.mjs",
-		"bench": "node tests/bench.mjs",
+		"bench": "npm --prefix examples run dev -- --open /bench.html",
 		"lint:skill": "node tests/skill-lint.mjs"
 	},
 	"devDependencies": {
-		"@jax-js/jax": "^0.1.21",
+		"@jax-js/jax": "^0.1.24",
 		"@jax-js/optax": "^0.1.2",
 		"playwright": "^1.62.0",
 		"vite": "^7.0.0"

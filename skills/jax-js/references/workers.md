@@ -1,286 +1,148 @@
-# Workers: the trainer, the RPC, and the sampler that keeps training alive
+# Workers, RPC and model lifecycle
 
-## Why a worker
-
-Training on the main thread janks the page even on WebGPU, because every loss
-readback blocks the thread that also runs layout and paint. Moving the model into
-a Web Worker measured *faster* than the main thread in practice, with the UI
-holding 60fps.
-
-Devices do not cross threads: `init()` and `defaultDevice()` are called **inside**
-the worker, and each worker gets its own `GPUDevice`.
-
-## The three layers
+Put sustained training in a worker so compilation, dispatch and readbacks do not
+block page input and paint. Initialize JaxJS inside each worker. Each owns its
+own device, arrays, optimizer, compiled functions and data.
 
 ```
-UI component  ──▶  Engine (main thread, promise RPC)  ──▶  Worker (owns jax-js)
+UI component → Engine (promise RPC) → Worker (model owner)
 ```
 
-The engine is a plain class, not framework state. The worker owns params,
-optimizer state, jitted functions and the dataset. The UI never sees an array.
+Keep arrays inside the worker. Send plain metrics and transferable buffers.
+Match responses to numeric request IDs; metrics events stream without settling
+the request. `templates/engine.ts` implements this contract.
 
-## The RPC protocol
+## Serialize access to the model
 
-One numeric id per call; a `metrics` event streams progress without resolving.
-
-**Worker side** — `templates/worker.ts`:
+An `async onmessage` is not a mutex: another message can run while training
+awaits a yield or readback. Serialize model operations. Let `stop` bypass the
+queue and set a flag; otherwise it waits behind the loop it is meant to stop.
 
 ```ts
-interface RpcRequest { id: number; op: string; [k: string]: unknown }
-
-const post = (msg: unknown, transfer?: Transferable[]) =>
-  (self as unknown as Worker).postMessage(msg, { transfer: transfer ?? [] });
-
-const handlers: Record<string, (req: RpcRequest) => unknown | Promise<unknown>> = {
-  init: handleInit, train: handleTrain, stop: () => { stopRequested = true; return {}; },
-  predict: handlePredict, export: handleExport, load: handleLoad, dispose: handleDispose,
-};
-
-self.onmessage = async (e: MessageEvent<RpcRequest>) => {
+let queue = Promise.resolve();
+self.onmessage = (e: MessageEvent<RpcRequest>) => {
   const req = e.data;
-  try {
-    const handler = handlers[req.op];
-    if (!handler) throw new Error(`unknown op: ${req.op}`);
-    const result = (await handler(req)) as Record<string, unknown> & { __transfer?: Transferable[] };
-    const transfer = result?.__transfer;
-    if (transfer) delete result.__transfer;
-    post({ id: req.id, ok: true, result }, transfer);
-  } catch (err) {
-    post({ id: req.id, ok: false, error: err instanceof Error ? `${err.name}: ${err.message}` : String(err) });
+  if (req.op === 'stop') {
+    stopRequested = true;
+    post({ id: req.id, ok: true, result: {} });
+    return;
   }
+  if (req.op === 'dispose') stopRequested = true;
+  queue = queue.then(() => dispatch(req)); // dispatch catches and replies to errors
 };
 ```
 
-The `__transfer` convention lets a handler return `{ buf, __transfer: [buf] }` and
-have the dispatcher move the buffer instead of copying it.
+`train`, `load`, `init`, evaluation, export and disposal must not mutate or read
+partially replaced state. The training handler yields periodically and checks
+`stopRequested`. A stop acknowledgement means the flag was set; await the active
+training promise or a subsequent queued operation to know training has ended.
+Avoid unbounded queues: the UI should allow one training request at a time.
 
-**Main-thread side** — `templates/engine.ts`:
+A handler can return `{ checkpoint, __transfer: [checkpoint] }`. The dispatcher
+removes `__transfer` and posts the result with the transfer list. A thrown handler
+error must reply to that request and leave the queue usable.
 
-```ts
-private call<T>(op: string, payload = {}, transfer: Transferable[] = [],
-                onMetrics?: (m: Metrics) => void): Promise<T> {
-  const id = this.nextId++;
-  return new Promise<T>((resolve, reject) => {
-    this.pending.set(id, { resolve, reject, onMetrics });
-    this.worker.postMessage({ id, op, ...payload }, transfer);
-  });
-}
+## Validate the data contract
 
-private onMessage(e: MessageEvent) {
-  const msg = e.data;
-  const p = this.pending.get(msg.id);
-  if (!p) return;
-  if (msg.event === 'metrics') { p.onMetrics?.(msg.m); return; }   // stream, don't settle
-  this.pending.delete(msg.id);
-  msg.ok ? p.resolve(msg.result) : p.reject(new Error(msg.error));
-}
-```
+Check configuration dimensions, finite numeric values, dataset lengths, token
+ranges and checkpoint shapes before using them to allocate arrays. Adapt those
+checks to the model; TypeScript casts do not validate runtime messages.
 
-### The worker validates everything it receives
+The language-model templates accept integer token IDs. `toPromptTokens()` checks
+integrality, vocabulary bounds and context length, catching tokenizer/model
+mismatches. This is a template contract, not a ban on worker-side tokenization.
+Tokenizing text does not neutralize its meaning or prevent prompt injection.
+Always display generated text through escaping, as described in [ui.md](ui.md).
 
-The main thread is not a trust boundary. Every RPC field gets checked on
-receipt: token sequences through `toPromptTokens()` (integers inside the
-vocabulary, length-capped), numeric knobs clamped to sane ranges.
+## Transferables
+
+Transferring an `ArrayBuffer` detaches it on the sender. Copy data that remains
+needed there:
 
 ```ts
-const prompt = toPromptTokens(req.promptTokens ?? [], {
-  vocab: c.vocab, maxLen: Math.floor(c.blockSize / 2) });
-const temperature = num(req.temperature, 0.8, 1e-4, 100);
-const topK = Math.floor(num(req.topK, 40, 0, c.vocab));
-```
-
-The message contract is **integer token IDs, never text** — encoding happens in
-the application layer (`templates/tokens.ts`). That keeps arbitrary strings out
-of model execution entirely, and turns an encoder/vocabulary mismatch into a
-thrown error instead of silently corrupt one-hots.
-
-### Transferables
-
-A transferred `ArrayBuffer` is **detached** on the sending side. If the caller
-still needs the data, copy first:
-
-```ts
-const copy = tokenData.slice();                     // detach the copy, not the original
+const copy = tokenData.slice();
 await this.call('init', { tokenData: copy.buffer }, [copy.buffer]);
 ```
 
-Transfer everything big: datasets in, checkpoints and activation dumps out.
+Transfer large datasets, checkpoints and activation dumps. This avoids a buffer
+clone, but GPU readback and upload are still real costs. Handle synchronous
+`postMessage` exceptions by removing and rejecting that pending request.
 
-### Making `stop` land
+## Disposal
 
-A tight training loop starves the worker's own message queue, so the `stop`
-message never gets processed. Yield every few steps:
+Use the tested implementation in `templates/engine.ts`:
+
+1. Send a graceful disposal request, then stop accepting new calls.
+2. Reject pending work so callers cannot hang; stale-result guards suppress
+   expected cancellation errors in unmounted or reset views.
+3. Give graceful cleanup a bounded deadline, then terminate in `finally`.
+4. Clear the deadline and reject any remaining requests before clearing the map.
+5. Make repeated `dispose()` calls share one shutdown operation.
+
+Handle worker `error` and `messageerror` the same way: reject pending work and
+close the unusable worker. Await disposal before replacing an engine when
+practical. Leaked workers consume resources; multiple workers do **not**
+inherently deadlock on one shared GPUDevice.
+
+## Generation counters and deadlines
+
+Tag each boot, reset and evaluation with a generation/revision. Check it after
+**every** await before writing UI state, including validation and sampling.
+Do the same in streaming metrics callbacks.
 
 ```ts
-for (let i = 0; i < steps; i++) {
-  if (stopRequested) break;
-  const t0 = performance.now();
-  const loss = trainStep();
-  post({ id: req.id, event: 'metrics', m: { step: ++stepCounter, loss, stepMs: performance.now() - t0 } });
-  if (i % 4 === 3) await new Promise((r) => setTimeout(r, 0));   // let 'stop' through
+const myGen = ++generation;
+const engine = new Engine(options);
+currentEngine = engine; // cleanup can reach it even during init
+try {
+  await guard('model initialization', engine.init(config));
+  if (myGen !== generation) return;
+  const value = await engine.valLoss();
+  if (myGen !== generation) return;
+  publish(value);
+} finally {
+  if (myGen !== generation) await engine.dispose();
 }
 ```
 
-### Disposal
-
-A worker mid-`jit` answers no RPC promptly, and a worker that never releases its
-`GPUDevice` blocks the next one from acquiring it. Give the graceful path a
-deadline and terminate either way:
+Increment generation before resetting or unmounting. A timeout only stops
+waiting; it does not cancel the underlying initialization. Dispose failed or
+superseded engines too, and offer Retry for recoverable boot failures.
 
 ```ts
-async dispose(): Promise<void> {
+async function guard<T>(what: string, promise: Promise<T>, ms = 25_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    await Promise.race([this.call('dispose'), new Promise((r) => setTimeout(r, 400))]);
-  } finally {
-    this.worker.terminate();
-    this.pending.clear();
-  }
+    return await Promise.race([promise, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${what} timed out`)), ms);
+    })]);
+  } finally { clearTimeout(timer); }
 }
 ```
 
-When rebuilding a model, **await** the old engine's `dispose()` before
-constructing the new one. Two workers racing for one GPU device deadlocks the
-page.
+## The twin-worker courier — optional concurrent inference
 
----
+For expensive samples while training continues, `templates/twin-engine.ts`
+uses a trainer and sampler. At a burst boundary, export weights and load them
+into the sampler; let the next burst overlap with inference. Keep the sampler's
+load/sample operations serialized and allow only one sample job at a time.
 
-## The twin-worker courier — the big win
+Record the checkpoint step at export, rather than labeling the result with the
+trainer's later step when sampling finishes. Drop results after reset. Fall back
+to inline inference if a second worker cannot initialize.
 
-**Problem.** The UI wants to show what the model can do *while it trains*: write a
-text sample, evaluate a position, render an attention map. If those calls go to
-the training worker, training stops for the duration. On a transformer that is
-hundreds of milliseconds per sample, and the loss curve visibly stutters.
-
-**Solution.** Boot a **second** worker with the same config. After each training
-burst, export a checkpoint from the trainer and load it into the sampler. The
-sampler answers the UI's inference calls on its own GPU device while the trainer
-keeps stepping.
-
-```ts
-class Lab {
-  private engine: Engine | null = null;     // trains
-  private sampler: Engine | null = null;    // answers, never trains
-  private samplerReady = false;
-
-  /** Which engine writes the next sample: the sampler, freshly loaded with the
-   *  trainer's current weights (training keeps running), or the trainer itself
-   *  when no sampler exists (the caller then waits, as it always used to). */
-  private async sampleEngine(): Promise<Engine | null> {
-    const e = this.engine;
-    const s = this.samplerReady ? this.sampler : null;
-    if (!e || !s) return e;
-    try {
-      const ckpt = await e.exportCheckpoint();   // one quick readback
-      await s.loadWeights(ckpt);                 // transferred, not copied
-      return s;
-    } catch {
-      this.samplerReady = false; this.sampler = null; void s?.dispose();
-      return this.engine;                        // degrade to inline sampling
-    }
-  }
-
-  private async loop() {
-    while (this.playing) {
-      await this.engine!.train(CHUNK, (m) => this.record(m));
-      const v = await this.engine!.valLoss();
-      this.valPoints.push([this.step, v]);
-      // With the sampler up, the sample is written on its own device while the
-      // next burst runs — the curve never pauses. Without it, wait inline.
-      if (this.samplerReady) void this.autoSample();
-      else await this.autoSample();
-    }
-  }
-}
-```
-
-Four properties make this work:
-
-- **Boot the sampler in the background, silently.** If it fails, sampling falls
-  back to the training worker — slower, never broken.
-- **Courier after the burst, before the next `train()` call.** Then the sample is
-  exactly the weights of the step it is labelled with. Honest, not approximate.
-- **`loadWeights` must be an in-place op**, not a re-init: it keeps the config,
-  the jit caches and the dataset, so it costs one buffer transfer. A full re-init
-  re-uploads the corpus.
-- **Never block the loop on the sampler.** `void this.autoSample()` — fire and
-  forget, guarded by a generation counter (below).
-
-### Cost
-
-One extra GPU device and one extra copy of the weights. For a 5M-parameter model
-that is ~20 MB — cheap for a loss curve that never stutters.
-
-### When *not* to use it
-
-If the UI only inspects the model while training is paused (a scrubber, a
-post-hoc probe), one worker is simpler and correct. Reach for the twin when
-inference and training genuinely overlap in time.
-
----
-
-## Generation counters
-
-Anything async can land after the model it belonged to has been replaced or
-disposed. A monotonically increasing `gen` makes every late arrival a no-op.
-
-```ts
-private gen = 0;
-
-async boot() {
-  const myGen = ++this.gen;
-  ...
-  const result = await something();
-  if (myGen !== this.gen) return;      // superseded — drop it on the floor
-  this.state = result;
-}
-
-disposeAll() {
-  this.gen++;                          // cancels every in-flight callback
-  void this.engine?.dispose();
-  this.engine = null;
-}
-```
-
-Also guard the *worker handle itself*, so a superseded boot hands its device
-back:
-
-```ts
-const superseded = () => {
-  if (myGen === this.gen) return false;
-  if (this.engine === engine) this.engine = null;
-  void engine.dispose();               // give the GPU device back
-  return true;
-};
-await engine.init(config);
-if (superseded()) return;
-```
-
-## Deadlines on every boot step
-
-A stalled fetch or a GPU device that never arrives leaves the UI saying
-"loading…" forever. Give each step a deadline so the user gets an error and a
-Retry button:
-
-```ts
-function guard<T>(what: string, p: Promise<T>, ms = 25_000): Promise<T> {
-  return Promise.race([
-    p,
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(`${what} timed out — try again`)), ms)),
-  ]);
-}
-
-const tok = await guard('the corpus', loadCorpus());
-await guard('the GPU', engine.init(config));
-```
+Budget the cost: 5M float32 weights alone occupy about 20 MB per copy, plus
+activations, compilation caches, temporary buffers, and optimizer state if the
+sampler initializes it. Separate devices still contend for physical GPU
+resources; overlap does not guarantee better throughput. A single worker with
+short pauses between bursts is often enough.
 
 ## Bundlers
 
-Vite and SvelteKit resolve module workers from a URL relative to the importing
-file:
-
 ```ts
-this.worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
+new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
 ```
 
-This works in dev and in build. Do not use a string path; it will not be bundled.
+Vite/SvelteKit resolve this relative module URL. A plain string path is not
+bundled the same way. Set `worker: { format: 'es' }` and test production output,
+not only the dev server.

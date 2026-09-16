@@ -5,7 +5,7 @@ stay smooth while something expensive runs underneath it.
 
 ## The lifecycle contract
 
-Five states, one variable. Every control reads from it; nothing infers.
+Explicit phases, one variable. Every control reads from it; nothing infers.
 
 ```ts
 type Phase = 'idle' | 'loading' | 'ready' | 'training' | 'error' | 'no-webgpu';
@@ -18,27 +18,29 @@ type Phase = 'idle' | 'loading' | 'ready' | 'training' | 'error' | 'no-webgpu';
   (Train, Play, Sample). Never a "Load" button; boot on demand.
 - **training** — the same button becomes Pause. Live numbers in the header.
 - **error** — the real message plus a Retry. Give every boot step a deadline
-  (see [workers.md](workers.md#deadlines-on-every-boot-step)) so a stalled fetch
+  (see [workers.md](workers.md#generation-counters-and-deadlines)) so a stalled fetch
   becomes an error, not an eternal spinner.
 - **no-webgpu** — a real fallback. Small models run on wasm; large ones get
   honest prose, a recorded animation, or a screenshot. Not a dead button.
 
-Probe for WebGPU on mount, before rendering any control, so the wrong affordance
-never appears.
+Probe capabilities before enabling GPU-dependent controls; select the actual
+backend during boot. Show a loading state while that decision is pending.
 
-## Never put the engine in reactive state
+## Separate resource handles from render state
 
-The engine holds a `Worker` and is not serialisable, not cloneable, and not
-something a framework should proxy. Keep it in a plain field.
+Keep the worker/engine in a component-owned plain field (Svelte) or ref (React),
+and expose metrics and phase as reactive values. This makes ownership and cleanup
+explicit. React `useState` does not proxy objects, and Svelte `$state` does not
+deeply proxy class instances; neither universally breaks `postMessage`.
 
-```ts
-// ✓ plain field
-let engine: Engine | null = null;
-// ✗ $state(new Engine(...)) / useState(engine) — the proxy will break postMessage
-```
+A Svelte plain-object state proxy is not structured-cloneable. Send a plain
+payload, a `$state.snapshot` of serializable data, or a copied typed array; do
+not send framework proxies or device arrays across the worker boundary.
 
-Only *derived numbers* belong in reactive state: step, loss, arrays of points,
-sample strings.
+Share a page-owned lab through context when several components need it. Avoid
+mutable server-side module singletons, which can be shared between SSR requests.
+See [Svelte state](https://svelte.dev/docs/svelte/$state) and
+[SvelteKit state management](https://svelte.dev/docs/kit/state-management).
 
 ## Boot when the user gets there, not on mount
 
@@ -73,92 +75,35 @@ const notify = () => {
 painting, and a trap for anything else. Never drive training progress, timeouts
 or e2e signals from rAF.
 
-## Svelte 5
+## Framework lifecycle
 
-```svelte
-<script lang="ts">
-  import { onDestroy } from 'svelte';
-  import { Engine, detectWebGPU } from '$lib/engine';
+`templates/ui-svelte5.svelte` uses runes for metrics and a plain engine field.
+`templates/ui-react.tsx` uses state for metrics and refs for resource handles.
+Adapt their imports and styling to the host app.
 
-  let phase = $state<'idle'|'loading'|'ready'|'training'|'error'|'no-webgpu'>('idle');
-  let step = $state(0);
-  let loss = $state(NaN);
-  let curve = $state<Array<[number, number]>>([]);
+- Create workers only in browser lifecycle paths, not during SSR or render.
+- Assign the engine handle before awaiting initialization, so cleanup can reach
+  an engine that is still booting. Dispose it on initialization failure as well.
+- Guard every asynchronous result and streamed metric with the current engine
+  identity or generation. An old boot, evaluation or training loop must not
+  publish into a new run.
+- In React development StrictMode, effects get an extra setup/cleanup cycle;
+  keep each effect's engine local and dispose that specific engine in cleanup.
+- In Svelte, `onDestroy` can run during server rendering; keep cleanup safe when
+  no worker was created. A reactive class can live in a `*.svelte.ts` module,
+  while its instance belongs to the page/context that owns its lifetime.
+- Coalesce paints, and cancel pending animation-frame callbacks on teardown.
 
-  // NOT $state: a Worker handle must not be proxied.
-  let engine: Engine | null = null;
-  let playing = false;
-
-  async function boot() {
-    if (phase !== 'idle') return;
-    phase = 'loading';
-    if (!(await detectWebGPU())) { phase = 'no-webgpu'; return; }
-    engine = new Engine({ tokenData });
-    await engine.init(config);
-    phase = 'ready';
-  }
-
-  async function toggle() {
-    if (phase === 'training') { playing = false; await engine?.stop(); phase = 'ready'; return; }
-    if (phase !== 'ready' || !engine) return;
-    playing = true; phase = 'training';
-    while (playing && engine) {
-      await engine.train(40, (m) => { step = m.step; loss = m.loss; curve.push([m.step, m.loss]); });
-      if (!playing) break;
-    }
-  }
-
-  onDestroy(() => { playing = false; void engine?.dispose(); engine = null; });
-</script>
-
-<div use:inview={boot}>…</div>
-```
-
-Notes specific to Svelte 5:
-
-- Runes only — `$state`, `$derived`, `$effect`, `$props`. No stores for this.
-- `curve.push(...)` on a `$state` array is reactive; you do not need to reassign.
-- For a model shared by several components, put the lab class in a
-  `*.svelte.ts` module with `$state` fields and export a single instance. The
-  page calls `disposeAll()` on unmount — GPU memory is no souvenir.
-- `onDestroy` also runs after server prerender, so keep it browser-safe.
-
-## React
-
-```tsx
-const engineRef = useRef<Engine | null>(null);
-const [phase, setPhase] = useState<Phase>('idle');
-const [metrics, setMetrics] = useState({ step: 0, loss: NaN });
-const curve = useRef<Array<[number, number]>>([]);
-
-useEffect(() => {
-  let cancelled = false;
-  (async () => {
-    setPhase('loading');
-    if (!(await detectWebGPU())) return setPhase('no-webgpu');
-    const e = new Engine({ tokenData });
-    await e.init(config);
-    if (cancelled) { void e.dispose(); return; }   // StrictMode double-mounts
-    engineRef.current = e;
-    setPhase('ready');
-  })();
-  return () => { cancelled = true; void engineRef.current?.dispose(); engineRef.current = null; };
-}, []);
-```
-
-React 18 StrictMode mounts effects twice in development. Without the `cancelled`
-flag you get two workers competing for one GPU device and a boot that never
-finishes. This is the single most common React + WebGPU bug.
-
-Batch metric updates — `setMetrics` on every step will re-render hundreds of
-times a second. Buffer into a ref and flush on rAF.
+The cancellation and RPC rules are in [workers.md](workers.md). A successful
+initialization after unmount is still a resource leak unless it is disposed.
 
 ## Charts
 
 SVG for loss curves, canvas for anything with thousands of points.
 
-- Log-scale the y axis. Loss falls by orders of magnitude; a linear axis shows
-  one big drop and then a flat line that hides all later progress.
+- Use a labeled log scale when positive loss spans orders of magnitude. Handle
+  zero/non-finite values explicitly; use a linear or suitable signed scale for
+  objectives that can be negative. Keep comparison axes consistent.
 - Train curve in the accent colour, validation in the contrast colour, and plot
   validation as points-plus-line at burst boundaries — it is measured less often
   and pretending otherwise is a lie.
@@ -179,8 +124,8 @@ ctx.setTransform(dpr, 0, 0, dpr, 0, 0);                  // every frame
 ctx.clearRect(0, 0, W, H);
 ```
 
-Read colours from CSS custom properties **at draw time**, so the canvas follows
-light/dark without a redraw hook:
+Read colours from CSS custom properties at draw time. If the canvas is not
+continuously animating, redraw when the theme changes:
 
 ```ts
 const token = (name: string, fallback: string) =>
@@ -197,37 +142,22 @@ animation; render a meaningful static frame instead.
   stage or in a side column. Keep the whole demo inside one viewport.
 - **Every control must change something visible.** If a slider would not visibly
   move the demo, cut it.
-- **No speed controls.** Pick one pace and tune it for reading.
+- Match existing app controls, typography and spacing. Use a pace tuned for
+  reading; add a speed control only if it helps the lesson.
 - Status line shows live truth: `step 240 · loss 0.312 nats · 12 ms/step`, in
   tabular numerals so digits do not jitter.
 - Disable, do not hide. A control that vanishes mid-run is disorienting.
 
-## Only token IDs cross into the worker
+## Token input contract
 
-Encode text in the application layer and hand the worker **integers**, never a
-string. `templates/tokens.ts` is that boundary:
+The language-model templates accept validated token IDs through
+`templates/tokens.ts`. Check integer values, vocabulary bounds and context
+length before building one-hots; an out-of-range ID can produce an all-zero row
+instead of a useful error. Recheck at the worker entry point.
 
-```ts
-import { encodePrompt, toPromptTokens } from './tokens';
-
-const BOUNDS = { vocab: cfg.vocab, maxLen: Math.floor(cfg.blockSize / 2) };
-const ids = encodePrompt(userText, corpus.encode, BOUNDS);   // validated here
-await lab.sampleNow(ids);                                     // engine re-validates
-                                                              // worker validates again
-```
-
-Two reasons, one practical and one structural:
-
-- An out-of-range ID reaches `nn.oneHot(id, vocab)` and quietly corrupts a batch
-  — you get gibberish samples instead of an error. Validating says *your encoder
-  and your model disagree about the vocabulary*, which is the actual bug.
-- The main thread is not a trust boundary. The worker re-checks on receipt, so a
-  malformed message cannot reach model execution. It also means no code path
-  carries arbitrary text into the model, which is what static analyzers flag as
-  indirect prompt-injection exposure.
-
-`toPromptTokens` throws rather than clamping, and truncates over-long input to
-the most recent `maxLen` IDs — which is what a context window does anyway.
+Encoding may live in the app or worker as appropriate. Encoding text as numbers
+does not make its content trusted. Validation prevents malformed tensors and
+vocabulary mismatches; it is not a prompt-injection defense.
 
 ## Never render model output as HTML
 
@@ -247,19 +177,39 @@ what you want; `{@html text}` and `dangerouslySetInnerHTML` are not. If the demo
 genuinely needs to render generated markdown, sanitise it — do not hand raw
 model output to a markdown renderer with HTML passthrough enabled.
 
-Static analyzers flag this data flow (user text → model → page) as an indirect
-prompt-injection risk. For an in-browser model that only writes into a `<div>`
-the label overstates it: there is no tool use, no agent loop, and no privileged
-action to hijack. But the escaping rule costs nothing and the flag disappears,
-so just follow it. It matters for real if you ever feed generated text into
-something that *acts* on it.
+## Show evidence of learning
 
-## Say what the numbers mean
+Keep training loss visible, with units and a useful baseline. Pair it with a
+fixed held-out test and a directly inspectable before/after example. The metric
+must test the claim the reader is meant to learn: classification accuracy,
+next-frame discrimination, a rollout versus persistence, or executed goal error.
+Do not replace the loss with an unexplained success badge.
 
-A loss of 0.35 means nothing on its own. Show the baseline: `uniform guess would
-be 3.18 nats`. Label the units. When a knob has a hidden cost — changing the
-learning rate resets Adam's moments, loading a checkpoint discards optimizer
-history — say so in the caption rather than pretending it is free.
+Choose one clear question for each plate and one intervention that answers it.
+For example: same history, different actions; same model, longer horizon; same
+initial weights/data, with and without a regularizer. A compact architecture
+SVG can connect what enters the model, what is learned, and what the loss
+compares. Reuse the same symbols and colors in diagrams, equations and controls.
+Inspect the rendered SVG, including subscripts, labels and arrow endpoints.
+
+Long comparisons need visible progress: show the phase, completed updates and
+partial evidence as it becomes available. Label old results with their checkpoint
+step while new evaluation is running. Keep stop/reset responsive and avoid a
+long blank stage followed by everything appearing at once.
+
+Separate training data, held-out evaluation and any fitted visualization readout.
+A decoder or renderer can hide model failures; disclose what is actually learned
+and what is supplied by geometry or labels. See [world-models.md](world-models.md).
+
+Changing learning rate does not inherently reset Adam. Describe the actual
+behavior of the implementation. Weights-only checkpoint loading usually does
+reset optimizer history; label that when relevant.
+
+For image inputs, verify crop and orientation against the main widget. A themed
+preview can use display-only inversion in dark mode without changing the raw
+pixels fed to the model. Preview enlargement is not increased sensor resolution.
+Check light/dark, narrow layouts, reduced motion and the app's existing visual
+language in a real browser.
 
 ## Reset that actually resets
 
@@ -270,5 +220,7 @@ this.initCkpt = await engine.exportCheckpoint();       // at boot
 await engine.loadWeights(this.initCkpt.slice(0));      // on reset; slice keeps the master
 ```
 
-Clear the curves and the samples at the same time. A reset that leaves the old
-loss curve on screen is a bug report waiting to happen.
+First stop/serialize active work and invalidate pending results. Then clear
+curves, samples and derived readouts together. A weights reset does not reset
+random generators, data order or optimizer history unless those are explicitly
+restored. Preserve all of them if the UI promises an identical replay.

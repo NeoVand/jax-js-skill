@@ -37,7 +37,7 @@ const act = (kind: Activation, x: any) =>
 	kind === 'relu' ? nn.relu(x) : kind === 'gelu' ? nn.gelu(x) : kind === 'silu' ? nn.silu(x) : np.tanh(x);
 
 /** Glorot-uniform weights, zero biases. Hidden layers may be zero-biased safely;
- *  output *weights* must not be zero (that would kill the gradient path). */
+ *  small random output weights let gradients reach earlier layers immediately. */
 export function initParams(cfg: MlpConfig, seed = cfg.seed ?? 0): MlpParams {
 	const shapes = layerShapes(cfg);
 	const n = shapes.length;

@@ -2,8 +2,7 @@
 // against:
 //
 //   1. StrictMode double-mounts effects in development. Without the `cancelled`
-//      guard you create two engines, they compete for one GPUDevice, and the
-//      boot never finishes. This is THE React + WebGPU bug.
+//      guard a superseded boot can leak its worker or overwrite the new UI.
 //   2. A metrics callback fires every step. setState on each one re-renders
 //      hundreds of times a second and becomes the bottleneck — buffer into a
 //      ref and flush once per animation frame.
@@ -27,9 +26,10 @@ export function TrainingPlate({ config, tokenData, chunk = 40 }: TrainingPlatePr
 	const [metrics, setMetrics] = useState({ step: 0, loss: NaN, stepMs: 0 });
 	const [, forceCurve] = useState(0);
 
-	// Refs, not state: a Worker handle must never be proxied or re-created.
+	// Refs own resource handles without triggering renders; state owns metrics.
 	const engineRef = useRef<Engine | null>(null);
 	const playingRef = useRef(false);
+	const runRef = useRef(0);
 	const trainCurve = useRef<Array<[number, number]>>([]);
 	const valCurve = useRef<Array<[number, number]>>([]);
 	const pendingRef = useRef<TrainMetrics | null>(null);
@@ -50,25 +50,37 @@ export function TrainingPlate({ config, tokenData, chunk = 40 }: TrainingPlatePr
 
 	useEffect(() => {
 		let cancelled = false; // StrictMode guard — see the note above
+		let ownedEngine: Engine | null = null;
 		(async () => {
 			setPhase('loading');
+			trainCurve.current = [];
+			valCurve.current = [];
+			pendingRef.current = null;
+			setMetrics({ step: 0, loss: NaN, stepMs: 0 });
 			setLoadNote('checking for a GPU…');
 			try {
 				if (!(await detectWebGPU())) {
 					if (!cancelled) setPhase('no-webgpu');
 					return;
 				}
+				if (cancelled) return;
 				setLoadNote('building the model on your GPU…');
 				const e = new Engine({ tokenData, seed: 42 });
+				ownedEngine = e;
+				engineRef.current = e;
 				await e.init(config);
 				if (cancelled) {
 					void e.dispose(); // hand the device back
 					return;
 				}
 				engineRef.current = e;
-				valCurve.current = [[0, await e.valLoss()]];
+				const initialLoss = await e.valLoss();
+				if (cancelled) return;
+				valCurve.current = [[0, initialLoss]];
 				setPhase('ready');
 			} catch (err) {
+				void ownedEngine?.dispose();
+				if (engineRef.current === ownedEngine) engineRef.current = null;
 				if (cancelled) return;
 				setErrorMsg(err instanceof Error ? err.message : String(err));
 				setPhase('error');
@@ -78,9 +90,11 @@ export function TrainingPlate({ config, tokenData, chunk = 40 }: TrainingPlatePr
 		return () => {
 			cancelled = true;
 			playingRef.current = false;
+			runRef.current++;
 			cancelAnimationFrame(rafRef.current);
-			const e = engineRef.current;
-			engineRef.current = null;
+			const e = ownedEngine;
+			if (engineRef.current === e) engineRef.current = null;
+			rafRef.current = 0;
 			if (e) void e.dispose();
 		};
 	}, [config, tokenData]);
@@ -89,19 +103,24 @@ export function TrainingPlate({ config, tokenData, chunk = 40 }: TrainingPlatePr
 		const e = engineRef.current;
 		if (!e) return;
 		if (playingRef.current) {
+			const pauseRun = ++runRef.current;
 			playingRef.current = false;
-			await e.stop();
-			setPhase('ready');
+			await e.stop().catch(() => {});
+			if (engineRef.current === e && pauseRun === runRef.current) setPhase('ready');
 			return;
 		}
 		playingRef.current = true;
+		const myRun = ++runRef.current;
 		setPhase('training');
-		while (playingRef.current && engineRef.current) {
+		while (playingRef.current && engineRef.current === e && myRun === runRef.current) {
 			try {
-				await e.train(chunk, pushMetrics);
-				if (!playingRef.current || !engineRef.current) break;
-				valCurve.current.push([trainCurve.current.at(-1)?.[0] ?? 0, await e.valLoss()]);
+				await e.train(chunk, (m) => { if (engineRef.current === e && myRun === runRef.current) pushMetrics(m); });
+				if (!playingRef.current || engineRef.current !== e || myRun !== runRef.current) break;
+				const value = await e.valLoss();
+				if (engineRef.current !== e || myRun !== runRef.current) return;
+				valCurve.current.push([trainCurve.current.at(-1)?.[0] ?? 0, value]);
 			} catch (err) {
+				if (engineRef.current !== e || myRun !== runRef.current) return;
 				playingRef.current = false;
 				setErrorMsg(err instanceof Error ? err.message : String(err));
 				setPhase('error');

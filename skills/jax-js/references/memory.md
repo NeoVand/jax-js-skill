@@ -1,15 +1,15 @@
 # Ownership, references, and leaks
 
-jax-js arrays are GPU buffers with **manual reference counting**. There is no
-garbage collector for them. This page is the full model; SKILL.md laws 1 and 2
+jax-js arrays own backend buffers with **manual reference counting**. JavaScript
+garbage collection does not replace their explicit ownership protocol. This page is the full model; SKILL.md laws 1 and 2
 are its summary.
 
 ## The rules, exactly
 
 1. A newly created array has `refCount === 1`.
-2. **Passing an array into anything decrements it by one.** That includes
-   `np.*` functions, methods on the array itself, `nn.*`, `random.*`, jitted
-   functions, optax `update`/`applyUpdates`, and `tree.*` helpers.
+2. Array operations consume their inputs: `np.*`, array methods, `nn.*`,
+   `random.*`, jitted functions and optimizer updates. Reading metadata and
+   traversing a tree are exceptions; see the table below.
 3. `.ref` increments by one and returns the same array. Use it to lend an extra
    consumption.
 4. When the count reaches zero the buffer is freed. Touching the handle after
@@ -23,7 +23,7 @@ Think of it as Rust's move semantics with an explicit `.clone()` spelled `.ref`.
 ```ts
 const a = np.array([1, 2, 3]);   // rc 1
 const b = a.ref;                 // rc 2, b === a
-np.sum(b);                       // rc 1  (b consumed)
+np.sum(b).dispose();             // rc 1  (b consumed; free the result too)
 np.sum(a).item();                // rc 0  (a consumed, freed)
 ```
 
@@ -40,9 +40,14 @@ np.sum(a).item();                // rc 0  (a consumed, freed)
 | `await blockUntilReady(x)` | **no** |
 | `a.ref`, `tree.ref(t)` | no — they *add* a reference |
 | `a.shape`, `a.size`, `a.dtype`, `a.ndim`, `a.refCount` | no |
+| `tree.leaves(t)`, `tree.flatten(t)` | no — traversal alone does not change leaf references |
+| `tree.map(fn, t)` | depends on `fn`: `x => x.size` borrows; `x => x.mul(2)` consumes |
 
-`.shape` and friends are the only free reads. Everything that moves data
-consumes.
+**Ownership is separate from autodiff.** `.ref` retains a use of the same
+value; it does not copy its buffer or stop its gradient. Use
+`lax.stopGradient(x)` only when the learning objective calls for a detached
+branch. For example, `grad(x => x.ref.mul(x))(3)` is 6, whereas
+`grad(x => lax.stopGradient(x.ref).mul(x))(3)` is 3 (using scalar arrays).
 
 ## The counting method
 
@@ -89,15 +94,11 @@ tree.leaves(tree.ref(params))          // array of leaves (each holding a ref)
 tree.flatten(t) / tree.unflatten(def, leaves)
 ```
 
-Counting parameters — note the `tree.ref` and the explicit dispose, because
-`tree.leaves` hands you live references:
+Counting parameters only borrows leaf metadata; no extra references are needed:
 
 ```ts
 export function paramCount(params: any): number {
-  const leaves = tree.leaves(tree.ref(params)) as any[];
-  const total = leaves.reduce((s, l) => s + l.size, 0);
-  for (const l of leaves) l.dispose();
-  return total;
+  return (tree.leaves(params) as any[]).reduce((s, l) => s + l.size, 0);
 }
 ```
 
@@ -137,20 +138,10 @@ jitStep.dispose();      // jit returns an OwnedFunction holding constants
 jitForward.dispose();
 ```
 
-In a worker, also terminate the worker — a worker that never releases its
-`GPUDevice` blocks the next one from acquiring it:
-
-```ts
-async dispose() {
-  try {
-    // a worker mid-jit answers nothing; give the graceful path a deadline
-    await Promise.race([this.call('dispose'), new Promise((r) => setTimeout(r, 400))]);
-  } finally {
-    this.worker.terminate();
-    this.pending.clear();
-  }
-}
-```
+In a worker, free owned arrays and jitted functions, then terminate the worker.
+Use a bounded graceful shutdown because compilation may delay its response.
+Reject all outstanding RPC promises before clearing the pending map; otherwise
+callers can remain suspended forever. See [workers.md](workers.md#disposal).
 
 ## Finding a leak
 

@@ -3,8 +3,8 @@
   transport that cannot get out of sync with the model.
 
   The two rules this file exists to demonstrate:
-    1. the engine is a PLAIN field, never $state — it holds a Worker, and a
-       reactive proxy breaks postMessage
+    1. the engine is a component-owned resource handle; metrics are reactive
+       and teardown disposes the worker, even while boot is pending
     2. the demo boots when it scrolls into view, not on mount — a prerendered
        page should not spin up a GPU device the reader may never reach
 -->
@@ -32,10 +32,11 @@
 	let trainCurve = $state<Array<[number, number]>>([]);
 	let valCurve = $state<Array<[number, number]>>([]);
 
-	// NOT $state — a Worker handle must not be proxied.
+	// Resource handle; rendering depends on the separate reactive metrics.
 	let engine: Engine | null = null;
 	let playing = false;
 	let gen = 0;
+	let run = 0;
 
 	const uniform = $derived(Math.log(config.vocab));
 	const canPlay = $derived(phase === 'ready' || phase === 'training');
@@ -46,7 +47,13 @@
 		phase = 'loading';
 		loadNote = 'checking for a GPU…';
 		try {
-			if (!(await detectWebGPU())) {
+			const stale = engine;
+			engine = null;
+			await stale?.dispose();
+			if (myGen !== gen) return;
+			const hasGpu = await detectWebGPU();
+			if (myGen !== gen) return;
+			if (!hasGpu) {
 				phase = 'no-webgpu';
 				return;
 			}
@@ -56,14 +63,18 @@
 			engine = e;
 			await e.init(config);
 			if (myGen !== gen) {
-				engine = null;
+				if (engine === e) engine = null;
 				void e.dispose();
 				return;
 			}
-			valCurve = [[0, await e.valLoss()]];
+			const initialLoss = await e.valLoss();
+			if (myGen !== gen) return;
+			valCurve = [[0, initialLoss]];
 			phase = 'ready';
 		} catch (err) {
 			if (myGen !== gen) return;
+			void engine?.dispose();
+			engine = null;
 			errorMsg = err instanceof Error ? err.message : String(err);
 			phase = 'error';
 		}
@@ -71,30 +82,35 @@
 
 	async function toggle() {
 		if (phase === 'training') {
+			const pauseRun = ++run;
+			const pauseGen = gen;
 			playing = false;
-			await engine?.stop();
-			if (phase === 'training') phase = 'ready';
+			await engine?.stop().catch(() => {});
+			if (pauseRun === run && pauseGen === gen && phase === 'training') phase = 'ready';
 			return;
 		}
 		if (phase !== 'ready' || !engine) return;
 		playing = true;
+		const myRun = ++run;
 		phase = 'training';
 		const myGen = gen;
-		while (playing && engine && myGen === gen) {
+		while (playing && engine && myGen === gen && myRun === run) {
 			const e = engine;
 			try {
 				await e.train(chunk, (m: TrainMetrics) => {
-					if (myGen !== gen) return;
+					if (myGen !== gen || myRun !== run) return;
 					step = m.step;
 					loss = m.loss;
 					stepMs = m.stepMs;
 					// pushing to a $state array is reactive — no reassignment needed
 					trainCurve.push([m.step, m.loss]);
 				});
-				if (!playing || myGen !== gen) break;
-				valCurve.push([step, await e.valLoss()]);
+				if (!playing || myGen !== gen || myRun !== run) break;
+				const value = await e.valLoss();
+				if (myGen !== gen || myRun !== run) return;
+				valCurve.push([step, value]);
 			} catch (err) {
-				if (myGen !== gen) return;
+				if (myGen !== gen || myRun !== run) return;
 				playing = false;
 				errorMsg = err instanceof Error ? err.message : String(err);
 				phase = 'error';

@@ -24,11 +24,11 @@ Full model in [memory.md](memory.md).
 
 `grad` through `np.take` inside `jit`. Use a one-hot matmul for the embedding
 (SKILL.md law 4). Eager `grad` through `take` works; jitted does not, as of
-0.1.21.
+0.1.24.
 
 ### `TypeError: count.item is not a function`
 
-You put optax inside `jit`. `@jax-js/optax@0.1.2`'s Adam bias correction reads
+You put the published Optax Adam update inside `jit`. `@jax-js/optax@0.1.2`'s Adam bias correction reads
 its step counter back to the host, which cannot be traced. Keep
 `solver.update` / `applyUpdates` outside the jitted function, or use
 `templates/fused-adam.ts`.
@@ -54,25 +54,26 @@ VAE waist emits `2 × latent` while the next layer expects `latent`.
 
 ### `WebGPU unavailable` / `requestAdapter()` returns null
 
-- Chrome/Edge on desktop, Firefox and Safari on macOS 26+, iOS 26+, Android.
-- `navigator.gpu` exists but `requestAdapter()` can still return null, and a
-  wedged GPU process never answers at all — race it against a timeout and treat
-  silence as "no".
-- In headless Chromium you need `--enable-unsafe-webgpu --use-angle=metal
-  --enable-features=WebGPU`, and the *full* Chromium build rather than the
-  headless shell — many CI images have no WebGPU at all. Design the test suite
-  so the API contracts run on cpu/wasm in Node and only the integration test
-  needs a GPU.
+- Test on HTTPS or localhost. `navigator.gpu` and `requestAdapter()` availability
+  depend on browser, operating system and drivers; feature-detect instead of
+  maintaining a browser-name allowlist.
+- The adapter can be null or initialization can fail. Bound boot attempts with
+  a deadline and show the selected fallback or a recoverable error.
+- Headless browser support differs from an interactive browser. Check the adapter
+  **after navigating to localhost**, not on `about:blank`. Report GPU tests as
+  skipped when unavailable; a CPU/wasm pass is not a WebGPU pass.
 
-### The boot hangs forever, or the second model never starts
+### Boot or reset hangs, or an old result appears after reset
 
-Two workers competing for one `GPUDevice`. A worker that is dropped without
-`terminate()` keeps its device, and the next `init()` waits forever.
+Inspect ownership and operation ordering rather than assuming device contention:
 
-- **Await** the old engine's `dispose()` before constructing the new one.
-- In React StrictMode, guard the effect with a `cancelled` flag — the
-  double-mount creates two engines.
-- Give every boot step a deadline so this surfaces as an error, not a spinner.
+- Dispose old engines and terminate workers; leaked workers retain resources.
+- Serialize worker model operations across `await`, with stop outside the queue.
+- Reject pending RPCs on shutdown or transport errors; clearing the map alone
+  leaves promises unresolved.
+- Guard each late result by generation/checkpoint revision. Cleanup must reach
+  an engine that is still initializing.
+- A timeout does not cancel the underlying work: dispose the timed-out engine.
 
 ### `postMessage` fails, or the data arrives empty
 
@@ -83,13 +84,13 @@ transferring anything you still need: `const copy = data.slice()`.
 
 ### The loss is flat from step 0
 
-In order of likelihood:
+Check these causes:
 
 1. **Params captured by a jit closure.** `jit((x) => forward(params, x))` bakes
    step-0 weights in as constants. Pass params as an argument.
-2. **A zero-initialised output projection** (`wo`, `mlpFc2`, the classifier
-   head). Zero there blocks all gradient into the block interior. Use small
-   random. See [models.md](models.md#initialisation).
+2. **Gradient flow and initialization.** A zero output projection blocks the
+   preceding branch initially, but can itself learn. Inspect per-layer gradient
+   norms; do not infer permanently stalled learning from zero init alone.
 3. Learning rate far too small, or Adam's `b2` too high for a short run.
 4. The loss does not actually depend on the parameters — check that the
    differentiated argument is the one you think it is (`argnums`).
@@ -108,8 +109,8 @@ In order of likelihood:
 
 ### The loss falls and then the samples are still gibberish
 
-Check what the loss is *per what*. A character model at 1.5 nats/token is doing
-well; a word-piece model at 1.5 nats/token is barely started. Report the uniform
+Check what the loss is *per what*. Its interpretation depends on tokenization, corpus and baseline; the same
+nats/token value is not comparable across different tokenizers. Report the uniform
 baseline (`Math.log(vocab)`) next to it. And confirm the sampler reads the same
 weights the trainer wrote — a stale checkpoint in a sampling worker looks exactly
 like a model that will not learn.
@@ -134,9 +135,8 @@ re-rendering on every metrics callback — coalesce to one paint per frame.
 
 ### The loss curve stutters whenever a sample is drawn
 
-Sampling is running on the training worker. Boot a second worker and courier the
-checkpoint. This is the twin-worker pattern
-([workers.md](workers.md#the-twin-worker-courier--the-big-win)).
+Sampling may be blocking training on the same worker. Try shorter or less frequent
+samples, or measure the optional [twin-worker pattern](workers.md#the-twin-worker-courier--optional-concurrent-inference).
 
 ### `stop` does nothing until the run finishes
 
@@ -145,8 +145,8 @@ The training loop is starving the worker's message queue. Yield every few steps:
 
 ### Training is slower than you expected on WebGPU
 
-For small models it genuinely is — dispatch latency dominates and the wasm
-backend wins. Measure before assuming. See [performance.md](performance.md).
+Dispatch latency can dominate small models, letting wasm win. Compare the
+actual workload and completed-work timings. See [performance.md](performance.md).
 
 ## When you suspect jax-js itself
 

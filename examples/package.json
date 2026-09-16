@@ -4,6 +4,6 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
-  "dependencies": { "@jax-js/jax": "^0.1.21", "@jax-js/optax": "^0.1.2" },
+  "dependencies": { "@jax-js/jax": "^0.1.24", "@jax-js/optax": "^0.1.2" },
   "devDependencies": { "typescript": "^5.9.0", "vite": "^7.0.0" }
 }

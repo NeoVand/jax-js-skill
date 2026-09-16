@@ -46,12 +46,12 @@ try {
 	optax = null;
 }
 
-const { init, defaultDevice, numpy: np, nn, jit, grad, valueAndGrad, tree, blockUntilReady } = jax;
+const { init, defaultDevice, numpy: np, nn, lax, jit, grad, valueAndGrad, tree, blockUntilReady } = jax;
 
 const jaxVersion = versionOf('@jax-js/jax') ?? 'unknown';
 const optaxVersion = optax ? versionOf('@jax-js/optax') : null;
 
-const KNOWN_JAX = '0.1.21';
+const KNOWN_JAX = '0.1.24';
 const KNOWN_OPTAX = '0.1.2';
 
 const results = [];
@@ -171,7 +171,8 @@ await check(4, 'grad through np.take still FAILS under jit', () => {
 		const [l, g] = f(np.zeros([3, 2]), np.array([1, 1], { dtype: np.int32 }));
 		l.dispose();
 		g.dispose();
-	} catch {
+	} catch (error) {
+		assert(/routine primitive scatter input is not imm/.test(String(error)), `unexpected failure: ${error}`);
 		failed = true;
 	}
 	f.dispose();
@@ -194,7 +195,7 @@ await check(4, 'the one-hot workaround gives correct gradients under jit', () =>
 
 // ── optax ───────────────────────────────────────────────────────────────────
 if (optax) {
-	await check('optax', 'optax still cannot be placed inside jit', () => {
+	await check('optax', 'published Optax Adam still cannot be placed inside jit', () => {
 		const solver = optax.adam(1e-1);
 		const params = { w: np.array([1.0, 2.0]) };
 		const st = solver.init(tree.ref(params));
@@ -205,8 +206,9 @@ if (optax) {
 		});
 		let failed = false;
 		try {
-			step(params, st);
-		} catch {
+			tree.dispose(step(params, st));
+		} catch (error) {
+			assert(/count\.item is not a function/.test(String(error)), `unexpected failure: ${error}`);
 			failed = true;
 		}
 		step.dispose();
@@ -285,6 +287,41 @@ if (optax) {
 		return `loss ${first.toFixed(4)} → ${last.toFixed(4)}`;
 	});
 }
+
+// ── ownership versus autodiff and recent numerical API changes ───────────────
+await check(1, '.ref retains gradients; stopGradient detaches', () => {
+	const both = jit(grad((x) => np.sum(x.ref.mul(x))));
+	const detached = jit(grad((x) => np.sum(lax.stopGradient(x.ref).mul(x))));
+	try {
+		assert(both(np.array([3])).item() === 6, '.ref changed the derivative');
+		assert(detached(np.array([3])).item() === 3, 'stopGradient did not detach');
+	} finally { both.dispose(); detached.dispose(); }
+	return 'ownership is independent of the gradient graph';
+});
+
+await check(1, 'tree traversal borrows leaf references', () => {
+	const p = { w: np.ones([2]) };
+	try {
+		const leaves = tree.leaves(p);
+		tree.flatten(p);
+		tree.map((x) => x.size, p);
+		assert(leaves[0] === p.w && p.w.refCount === 1, 'traversal changed ownership');
+	} finally { tree.dispose(p); }
+});
+
+await check('0.1.22+', 'integer and boolean means are fractional', () => {
+	assert(np.mean(np.array([1, 2], { dtype: np.int32 })).item() === 1.5, 'integer mean truncated');
+	assert(np.mean(np.array([true, false], { dtype: np.bool })).item() === 0.5, 'boolean mean truncated');
+});
+
+await check('0.1.24', 'select and NaN-aware reductions compile', () => {
+	const select = jit((x) => np.select([x.ref.less(0)], [x.neg()], 0));
+	try { assert(JSON.stringify(select(np.array([-3, 2])).js()) === '[3,0]', 'wrong selection'); }
+	finally { select.dispose(); }
+	const mean = jit((x) => np.nanmean(x));
+	try { assert(mean(np.array([1, NaN, 3])).item() === 2, 'wrong nanmean'); }
+	finally { mean.dispose(); }
+});
 
 // ── report ──────────────────────────────────────────────────────────────────
 let failed = 0;

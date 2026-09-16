@@ -7,7 +7,7 @@
 // is fine for most models; this is for when the step is small enough that the
 // JS round-trip is a real fraction of the time.
 //
-// Verified to converge bit-for-bit with optax's adam() on the same problem.
+// Tested against optax's adam() on the same problem within float tolerances.
 //
 // The bias-correction constants go in as DEVICE SCALARS, not staticArgnums:
 // a static argument recompiles for every distinct value, and the step counter

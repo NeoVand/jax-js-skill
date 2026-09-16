@@ -19,8 +19,8 @@ on WebGPU.
 npx skills add NeoVand/jax-js-skill
 ```
 
-Works with Claude Code, Cursor, Codex, Copilot, Windsurf, Cline, Gemini and the
-other 70-odd agents the `skills` CLI supports.
+Install through the `skills` CLI for supported coding agents, or read
+[SKILL.md](skills/jax-js/SKILL.md) directly.
 
 ## What it knows
 
@@ -30,43 +30,52 @@ writing jax-js from general knowledge produces code that throws
 `Referenced tracer ... freed` on the second line. This skill front-loads the
 ownership model, then gets specific:
 
-- **Five laws** that prevent the failures: ownership and `.ref`, readback
+- **Five core rules** covering: ownership and `.ref`, readback
   consuming, `jit` shape caching and the closure trap, one-hot embeddings, and
   worker architecture.
 - **Architecture** — a worker that owns the model, a promise RPC on the main
-  thread, and the *twin-worker courier*: a second worker that answers the UI
-  from couriered checkpoints so training never pauses to draw a sample.
+  thread, serialized model operations, bounded disposal, and an optional second
+  worker for concurrent inference when its memory and transfer costs are justified.
 - **Model recipes** — MLP, autoencoder, VAE, decoder-only transformer with
-  attention and residual-stream capture, REINFORCE/GRPO, DPO.
+  attention and residual-stream capture, REINFORCE, group-relative advantages
+  (distinguished from full GRPO), and DPO.
 - **UI patterns** — lifecycle phases, boot-on-scroll, coalesced rendering,
   charts, canvas, and the Svelte 5 / React versions of each.
-- **Measured performance guidance**, not folklore. See below.
+- **World models and learning evidence** — action/history alignment, gradient
+  paths, collapse checks, held-out baselines, faithful rollouts and planning.
+- **Performance guidance** separating measured local results from API contracts.
 
 ## What it found
 
-Everything the skill asserts is verified by `tests/api.test.mjs` (38 assertions,
-runs in Node on cpu/wasm) and measured by `examples/bench.html` (a real browser,
-a real GPU). Some results were surprising:
+Verified **2026-09-16** against **jax-js 0.1.24** and **optax 0.1.2**. The
+Node suite checks numerical/ownership contracts and RPC lifecycle behavior; the
+browser suite runs training, concurrent sampling when WebGPU is available,
+checkpoint replacement during a yielding train, and stop handling.
 
-| Finding | Measured |
+| Current finding | Guidance |
 | --- | --- |
-| Fusing the optimizer into `jit` instead of running optax outside it | **2.9× faster** on a 235k-param transformer on WebGPU; up to 6× on small MLPs |
-| `grad` through `np.take` inside `jit` | still throws at 0.1.21 — embeddings must be one-hot matmuls |
-| `@jax-js/optax@0.1.2` inside `jit` | impossible: `treeBiasCorrection` reads its counter back to the host |
-| `.item()` / `.js()` / `.dataSync()` / `await .data()` | **all consume** the array — `x.item(); x.dispose();` is a double free |
-| wasm vs WebGPU below ~100k params | wasm **ties or wins** — dispatch latency dominates |
-| WebGPU at 5.3M params | 10× faster than wasm (56 ms/step — still interactive) |
-| Syncing the loss every step vs every 10 | every step is **1.8× faster** (jax-js issue #151 reproduces) |
+| Jitted `grad` through the tested `np.take` embedding path still fails | Keep the one-hot workaround and recheck on upgrade |
+| Published Optax Adam 0.1.2 reads its counter on the host | Keep Adam outside `jit`, or use the tested fused implementation |
+| `.item()`, `.js()`, `.dataSync()` and `.data()` consume arrays | Do not dispose the same use after reading it |
+| `.ref` retains ownership without detaching gradients | Use `lax.stopGradient` only where the objective specifies it |
+| `mean` on integer/boolean inputs was fixed in 0.1.22 | Fractional accuracy masks now reduce correctly |
+| Optimizer state is explicit | Changing Adam's rate can preserve moments |
+
+The older Chrome 148 / Apple Silicon benchmarks used **jax-js 0.1.21**. They
+found benefits from optimizer fusion, wasm on small workloads, and per-step
+synchronization. Those numbers are historical, not new 0.1.24 measurements or
+universal hardware thresholds. See [performance.md](skills/jax-js/references/performance.md)
+and rerun `/bench.html` on the target device.
 
 ## Layout
 
 ```
 skills/jax-js/
-  SKILL.md              the five laws, the canonical step, routing
-  references/           api · memory · workers · models · rl · ui · performance · troubleshooting
+  SKILL.md              core rules, the canonical step, routing
+  references/           api · memory · workers · models · world-models · rl · ui · performance · troubleshooting
   templates/            runnable: worker, engine, twin-engine, transformer, MLP, fused Adam, Svelte, React
   scripts/
-    doctor.mjs          re-verify every assumption against the installed version
+    doctor.mjs          probe critical assumptions against the installed version
     scaffold.mjs        write a runnable vite + worker starter
 examples/               two working demos + the benchmark suite
 tests/                  the contract tests
@@ -76,20 +85,28 @@ tests/                  the contract tests
 
 ```bash
 npm install
-npm test                       # 38 API + template contract assertions, in Node
+npm --prefix examples install
+npm test                       # Node numerical/lifecycle tests + browser integration
+npm run lint:skill             # frontmatter, size and link checks
+npm --prefix examples run build # production worker bundling
 node skills/jax-js/scripts/doctor.mjs
 cd examples && npm install && npm run dev      # /sine.html /gpt.html /bench.html
 ```
 
 `doctor.mjs` is the important one on upgrade: jax-js moves fast, and two of the
-five laws exist only because of gaps that may close. Some of its failures are
+core rules contain workarounds for gaps that may close. Some of its failures are
 good news, and it says so.
 
 ## Provenance
 
 The architecture comes from [jaxverse](https://github.com/NeoVand/jaxverse), an
-interactive book that trains eight real models in the browser — including the
-twin-worker courier, which is why its loss curves do not stutter while the model
-is writing.
+interactive book with browser-trained models, including language models and a
+latent world-model chapter. Its experiments inform the worker, evaluation and
+teaching patterns; they do not establish universal architecture rankings.
+
+Library changes are checked against the [upstream releases](https://github.com/ekzhang/jax-js/releases)
+and installed package code. The new world-model guidance distinguishes the
+[LeWorldModel method](https://arxiv.org/abs/2603.19312v3) from the book's smaller
+MLP adaptation.
 
 MIT.

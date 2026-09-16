@@ -58,8 +58,8 @@ function mulberry32(seed: number) {
 }
 let rng = mulberry32(1234);
 
-/** One optimizer step. The loss is synced every step on purpose: letting steps
- *  queue up and blocking once at the end measures ~2× SLOWER on WebGPU. */
+/** One optimizer step with a scalar readback. This bounds queued work and gives
+ *  live metrics; benchmark other sync cadences on the target device. */
 function trainStep(): number {
 	const c = cfg!;
 	const { tokenOH, posOH, targetOH } = model.makeBatchOH(c, tokenData!, rng, BATCH, 0, valStart);
@@ -76,6 +76,7 @@ function trainStep(): number {
 // ── op handlers ─────────────────────────────────────────────────────────────
 
 async function handleInit(req: RpcRequest) {
+	handleDispose(); // release old compiled functions as well as model arrays
 	const devices = await init();
 	// Prefer WebGPU; fall back rather than dying, unless the model is too big.
 	device = devices.includes('webgpu') ? 'webgpu' : devices.includes('wasm') ? 'wasm' : 'cpu';
@@ -255,8 +256,7 @@ const handlers: Record<string, (req: RpcRequest) => unknown | Promise<unknown>> 
 	dispose: handleDispose
 };
 
-self.onmessage = async (e: MessageEvent<RpcRequest>) => {
-	const req = e.data;
+async function dispatch(req: RpcRequest) {
 	try {
 		const handler = handlers[req.op];
 		if (!handler) throw new Error(`unknown op: ${req.op}`);
@@ -273,4 +273,18 @@ self.onmessage = async (e: MessageEvent<RpcRequest>) => {
 			error: err instanceof Error ? `${err.name}: ${err.message}` : String(err)
 		});
 	}
+}
+
+// An async message handler alone permits load/dispose to race a yielding train
+// loop. Serialize every model operation; stop must bypass that queue.
+let queue = Promise.resolve();
+self.onmessage = (e: MessageEvent<RpcRequest>) => {
+	const req = e.data;
+	if (req.op === 'stop') {
+		stopRequested = true;
+		post({ id: req.id, ok: true, result: {} });
+		return;
+	}
+	if (req.op === 'dispose') stopRequested = true;
+	queue = queue.then(() => dispatch(req));
 };

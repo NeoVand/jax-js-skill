@@ -1,4 +1,4 @@
-// Contract tests for every claim the skill makes about jax-js.
+// Numerical and ownership contracts used by the skill and model templates.
 // Runs on cpu/wasm in Node — no browser needed. Re-run on every jax-js upgrade:
 //   node --test tests/api.test.mjs
 import { test, before, describe } from 'node:test';
@@ -144,17 +144,19 @@ describe('law 1 — ownership', () => {
 		assert.ok(throws(() => a.dispose()));
 	});
 
-	test('.ref yields an independent handle', () => {
+	test('.ref retains another use of the same handle', () => {
 		const a = np.array([5]);
 		const b = a.ref;
+		assert.equal(b, a);
 		a.dispose();
 		assert.equal(np.sum(b).item(), 5);
 	});
 
 	test('tree.ref / tree.map / tree.dispose', () => {
 		const t = { a: np.ones([2]), l: [np.zeros([3])] };
-		assert.equal(tree.leaves(tree.ref(t)).length, 2);
-		tree.dispose(tree.ref(t)); // free the refs we just took
+		const retained = tree.ref(t);
+		assert.equal(tree.leaves(retained).length, 2);
+		tree.dispose(retained); // release precisely the references we retained
 		const doubled = tree.map((x) => x.mul(2), t);
 		assert.deepEqual(doubled.a.js(), [2, 2]);
 		doubled.l[0].dispose();
@@ -252,7 +254,8 @@ describe('law 4 — embeddings', () => {
 			const [l, g] = f(np.zeros([3, 2]), np.array([1, 1], { dtype: np.int32 }));
 			l.dispose();
 			g.dispose();
-		} catch {
+		} catch (error) {
+			assert.match(String(error), /routine primitive scatter input is not imm/);
 			failed = true;
 		}
 		f.dispose();
@@ -310,8 +313,9 @@ describe('optax', () => {
 		});
 		let failed = false;
 		try {
-			step(params, st);
-		} catch {
+			tree.dispose(step(params, st));
+		} catch (error) {
+			assert.match(String(error), /count\.item is not a function/);
 			failed = true;
 		}
 		step.dispose();
@@ -690,5 +694,79 @@ describe('template: model-transformer', () => {
 		}
 		jitRes.dispose();
 		gpt.disposeTree(params);
+	});
+});
+
+// ── version changes and lessons from latent-model training ───────────────────
+describe('0.1.24 API and learning contracts', () => {
+	test('integer and boolean means retain fractions, eagerly and under jit', () => {
+		for (const reduce of [np.mean, jit((x) => np.mean(x))]) {
+			assert.equal(reduce(np.array([1, 2], { dtype: np.int32 })).item(), 1.5);
+			assert.equal(reduce(np.array([true, false], { dtype: np.bool })).item(), 0.5);
+			reduce.dispose?.();
+		}
+	});
+
+	test('new select and NaN-aware reduction APIs run under jit', () => {
+		const select = jit((x) => np.select([x.ref.less(0)], [x.neg()], 0));
+		assert.deepEqual(select(np.array([-3, 2])).js(), [3, 0]);
+		select.dispose();
+		const reduce = jit((x) => np.nanmean(x));
+		assert.equal(reduce(np.array([1, NaN, 3])).item(), 2);
+		reduce.dispose();
+		assert.deepEqual(np.nancumsum(np.array([1, NaN, 3])).js(), [1, 1, 4]);
+	});
+
+	test('new norm, diff and stable log1mexp helpers have expected values', () => {
+		assert.equal(np.linalg.norm(np.array([3, 4])).item(), 5);
+		assert.deepEqual(np.diff(np.array([1, 4, 9])).js(), [3, 5]);
+		const value = nn.log1mexp(np.array([1e-6])).item();
+		assert.ok(Math.abs(value - Math.log(-Math.expm1(-1e-6))) < 1e-5);
+	});
+
+	test('tree traversal borrows leaves without adding or consuming references', () => {
+		const p = { w: np.ones([2]), b: np.zeros([1]) };
+		const leaves = tree.leaves(p);
+		const [flat] = tree.flatten(p);
+		assert.deepEqual(tree.map((x) => x.size, p), { w: 2, b: 1 });
+		assert.equal(leaves[0], flat[0]);
+		assert.ok(leaves.every((x) => x.refCount === 1));
+		tree.dispose(p);
+		assert.ok(leaves.every((x) => x.refCount === 0));
+	});
+
+	test('.ref propagates gradients; stopGradient explicitly detaches', () => {
+		const both = jit(grad((x) => np.sum(x.ref.mul(x))));
+		const detached = jit(grad((x) => np.sum(lax.stopGradient(x.ref).mul(x))));
+		assert.equal(both(np.array([3])).item(), 6);
+		assert.equal(detached(np.array([3])).item(), 3);
+		both.dispose();
+		detached.dispose();
+	});
+
+	test('changing Adam rate while preserving state matches a schedule, not a reset', () => {
+		const run = (mode) => {
+			let solver = adam(mode === 'schedule' ? (t) => t < 4 ? 0.1 : 0.01 : 0.1);
+			let params = { w: np.array([1, 2]) };
+			let state = solver.init(tree.ref(params));
+			for (let step = 0; step < 8; step++) {
+				if (step === 4 && mode !== 'schedule') {
+					solver = adam(0.01);
+					if (mode === 'reset') {
+						tree.dispose(state);
+						state = solver.init(tree.ref(params));
+					}
+				}
+				const grads = { w: np.array(step < 4 ? [1, 2] : [-2, 1]) };
+				const [updates, next] = solver.update(grads, state, tree.ref(params));
+				params = applyUpdates(params, updates);
+				state = next;
+			}
+			tree.dispose(state);
+			return params.w.js();
+		};
+		const scheduled = run('schedule'), retained = run('retain'), reset = run('reset');
+		assert.ok(scheduled.every((v, i) => Math.abs(v - retained[i]) < 1e-6));
+		assert.ok(reset.some((v, i) => Math.abs(v - retained[i]) > 1e-3));
 	});
 });
